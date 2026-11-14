@@ -3931,6 +3931,8 @@ static std::wstring firstSubdirLike(const std::wstring& dir, const std::wstring&
     return name;
 }
 
+#include "epic_detection_cases.h"
+
 static void testMirror(const std::wstring& scratch) {
     printf("\nthe mirror kept outside the game folder\n");
 
@@ -7709,6 +7711,7 @@ int wmain(int argc, wchar_t** argv) {
     testFlatSettingsPlanner();
     testApply(scratch);
     testMirror(scratch);
+    testEpicDetection(scratch);
     testAtomicWrite(scratch);
     testReplaceScripts(scratch);
     testApplyPatience(scratch);
