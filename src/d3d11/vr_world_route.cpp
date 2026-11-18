@@ -153,6 +153,7 @@ FlatMonoResolveMode resolveModeFromConfig(bool* known) {
     // XeSS stays on the world route's fallback: the route's jitter is the flat profile's phase cycle, which has no XeSS minimum
     // (only flat_runtime's own, flat_mono_resolve.cpp:259 refuses a short one), so the route would not get its jitter right.
     if (known) *known = temporalModeEnabled(m) && _stricmp(m.c_str(), "xess") != 0;
+    if (_stricmp(m.c_str(), "dittosr") == 0) return FlatMonoResolveMode::Ditto;
     if (_stricmp(m.c_str(), "fsr") == 0) return FlatMonoResolveMode::Fsr;
     if (_stricmp(m.c_str(), "dlss") == 0) return FlatMonoResolveMode::Dlss;
     if (_stricmp(m.c_str(), "dlaa") == 0) return FlatMonoResolveMode::Dlaa;

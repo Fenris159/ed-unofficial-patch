@@ -110,7 +110,8 @@ void rebuildItems(List* list) {
     bool hideAaPreset = false;
     for (const SettingRow& r : rows) {
         if (isVscreenKey(*r.def, "temporal_aa")) {
-            hideAaPreset = _stricmp(effectiveValue(r).c_str(), "fsr") == 0;
+            hideAaPreset = _stricmp(effectiveValue(r).c_str(), "fsr") == 0 ||
+                           _stricmp(effectiveValue(r).c_str(), "dittosr") == 0;
             break;
         }
     }

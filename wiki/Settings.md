@@ -43,6 +43,7 @@ The default is off. Elite draws edges without temporal anti-aliasing, so fine li
 | --- | --- |
 | DLSS | An NVIDIA RTX card. The launcher places NVIDIA's file on a machine with an NVIDIA card. |
 | FSR | Any graphics card. Nothing further to download. |
+| DittoSR | Any graphics card, as an alternative to FSR. Nothing further to download. [DittoSR 0.5.0](https://github.com/Vancete/DittoSR/releases/tag/v0.5.0) runs inside ED-UP. Do not point DittoSR's own loader at Elite: this game does not load the file that loader replaces. |
 | XeSS | Any graphics card, and fastest on Intel Arc. On other cards it costs more frame time than DLSS or FSR. |
 | On | ED-UP's own anti-aliasing. |
 
@@ -50,7 +51,18 @@ Set Elite's own anti-aliasing to Off or SMAA while one of these is on. If DLSS i
 
 In a headset, **HMD Image Quality** is the size the game renders. Below 1.0 the game renders smaller and the upscaler fills the headset size back in. That is where the frame time is saved. At 1.0 and above, DLSS runs at full size. Leave Elite's **Supersampling** at 1.0 in VR. Below that, the game scales the world before ED-UP sees it, and the headset shows a notice. On a monitor, Supersampling is the render size.
 
-[The full upscaler notes](https://github.com/characterecho-sean/ed-unofficial-patch/blob/main/docs/fixes.md#upscaling-dlss-fsr-and-xess).
+[The full upscaler notes](https://github.com/characterecho-sean/ed-unofficial-patch/blob/main/docs/fixes.md#upscaling-dlss-fsr-dittosr-and-xess).
+
+DittoSR's sharpness, frame weight and sharpening filter are optional lines under `[advanced]` in `edvr.ini` or `edvr-flat.ini`. They are not rows on F8. The defaults are sharpness `0.6`, frame weight `2` and sharpening `cas` (`rcas` is the other filter).
+
+```
+[advanced]
+dittosr_sharpness = 0.6
+dittosr_frame_weight = 2
+dittosr_sharpen = cas
+```
+
+A change applies on the next frame. Lower frame weight holds the previous frames longer. Sharpness `0` is soft and `1` is sharp.
 
 ### Frame generation on a monitor
 

@@ -20,6 +20,7 @@
 #include "flat_celestial.h"    // planet patch motion: the rows' tangents for the records the resolve binds (fetchCelestialRecords)
 #include "celestial_motion.h"
 #include "xess_engine.h"
+#include "dittosr_engine.h"
 #include "xess_fg.h"   // xessFgWanted: the resolver keeps the edge strip's motion for frame generation
 #include "flat_projection_recipes.h"
 #include "flat_shader_classifier.h"
@@ -4423,6 +4424,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     }
     if (mode != s.mode) {
         if (s.engine == FlatMonoResolveMode::Xess) xessReleaseFeatures();
+        if (s.engine == FlatMonoResolveMode::Ditto) dittoReleaseFeatures();
         s.haveResolvePlan=false;s.resolvePreflight={};s.resolvePreflightRetryMs=0;
         s.mode = mode; reset();
         // A new mode is a new question for the stand-down: everything restarts.
@@ -4430,6 +4432,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         engineVelocityConfigure(enabled);
         s.phase.resetHistory();
         s.engine = _stricmp(mode.c_str(), "xess") == 0 ? FlatMonoResolveMode::Xess :
+            _stricmp(mode.c_str(), "dittosr") == 0 ? FlatMonoResolveMode::Ditto :
             _stricmp(mode.c_str(), "fsr") == 0 ? FlatMonoResolveMode::Fsr :
             _stricmp(mode.c_str(), "dlss") == 0 ? FlatMonoResolveMode::Dlss :
             _stricmp(mode.c_str(), "dlaa") == 0 ? FlatMonoResolveMode::Dlaa : FlatMonoResolveMode::Taa;
