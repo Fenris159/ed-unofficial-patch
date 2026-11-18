@@ -4482,9 +4482,11 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     Ptr<ID3D11Device> actualDevice; swap->GetDevice(IID_PPV_ARGS(&actualDevice));
     if (s.device && actualDevice.Get() != s.device.Get()) {
         flatRuntimeResize();
-        // Resize releases XeSS features; end its device binding before this
-        // render thread adopts the replacement device.
+        // Resize releases the features. End both device bindings before this
+        // render thread adopts the replacement device. DittoSR's shutdown only
+        // releases its shaders and histories; it does not wait on the GPU.
         xessShutdown();
+        dittoShutdown();
         s.thread = GetCurrentThreadId();
     }
     if (!s.device) { swap->GetDevice(IID_PPV_ARGS(&s.device)); if (s.device) s.device->GetImmediateContext(&s.context); }

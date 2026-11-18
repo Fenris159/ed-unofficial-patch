@@ -99,7 +99,8 @@ engine is AMD's FidelityFX Super Resolution 3.1 upscaler through its community
 Direct3D 11 port (the optiscaler project's FidelityFX-SDK-DX11, MIT), compiled
 into `d3d11.dll`; its notice ships as `FIDELITYFX-SDK-DX11-LICENSE.txt`.
 DittoSR 0.5.0 is compiled into the same DLL (MIT; it derives from Snapdragon
-Game Super Resolution 2, BSD-3-Clause). Notices are in `third_party/dittosr`.
+Game Super Resolution 2, BSD-3-Clause). The release carries
+`DITTOSR-LICENSE.txt` and `DITTOSR-GSR-LICENSE.txt`.
 
 Not affiliated with, endorsed by, or supported by Frontier Developments plc or
 Valve Corporation. Elite Dangerous is a trademark of Frontier Developments plc.

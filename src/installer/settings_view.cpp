@@ -503,6 +503,11 @@ void paint(List* list) {
 
 void applyValue(List* list, size_t rowIndex, const std::string& value) {
     if (!list->model) return;
+    // DittoSR's rows and the DLSS preset appear or leave with this choice.
+    // The click returns as soon as this write finishes, so rebuilding the
+    // list here is the paint the next frame sees.
+    const bool aa = rowIndex < list->model->rows().size() && list->model->rows()[rowIndex].def &&
+                    isVscreenKey(*list->model->rows()[rowIndex].def, "temporal_aa");
     if (!list->model->set(rowIndex, value)) {
         list->error = list->model->lastError();
         MessageBoxW(GetParent(list->hwnd), fromUtf8(list->error).c_str(), kAppTitle,
@@ -513,6 +518,7 @@ void applyValue(List* list, size_t rowIndex, const std::string& value) {
         // on install: the mirror exists so a game update between now and the
         // next install cannot take today's change with it.
         updateMirrorIni(list->model->gameDir(), list->mirrorDir);
+        if (aa) rebuildItems(list);
     }
     InvalidateRect(list->hwnd, nullptr, TRUE);
 }

@@ -7085,6 +7085,9 @@ void temporalPassShutdown() {
     skyRingShutdown();   // stops the dispatches and drops the waiting dumps; the ring itself is left to the process (sky_ring.cpp)
     dlaaShutdown();
     fsr3Shutdown();
+    // Releases DittoSR's shaders and histories. Unlike xessShutdown it does not signal or wait on the GPU, so it is safe
+    // under the loader lock that can own this teardown (device_hook.cpp, shutdownDeviceHooks).
+    dittoShutdown();
     // No xessShutdown here: it signals, flushes and waits on the GPU, and this teardown can run under the loader lock
     // (device_hook.cpp, shutdownDeviceHooks). The XeSS bridge is left for the process, as at exit (xess_engine.cpp, g_state).
     if (g_csMv) { g_csMv->Release(); g_csMv = nullptr; }
