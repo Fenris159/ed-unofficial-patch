@@ -123,6 +123,7 @@ void rebuildItems(List* list) {
         if (hideAaPreset && isVscreenKey(*rows[i].def, "temporal_aa_model")) continue;
         if (!showDitto && (isVscreenKey(*rows[i].def, "dittosr_sharpness") ||
                            isVscreenKey(*rows[i].def, "dittosr_frame_weight") ||
+                           isVscreenKey(*rows[i].def, "dittosr_anti_shimmer") ||
                            isVscreenKey(*rows[i].def, "dittosr_sharpen"))) continue;
         const std::wstring wanted = headingFor(*rows[i].def);
         if (!haveHeading || wanted != heading) {

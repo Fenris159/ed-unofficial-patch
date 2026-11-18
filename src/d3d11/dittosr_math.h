@@ -48,6 +48,7 @@ struct DittoEval {
     bool autoExposure = false;
     float sharpness = 0.6f;     // 0 soft, 0.6 as reconstructed, 1 sharpened
     float frameWeight = 2.0f;   // 0.25..4; lower holds history longer
+    float antiShimmer = -1.0f;  // below 0: the ratio's own strength; 0 off; otherwise 0.1..0.9
     int sharpenMode = 0;        // 0 CAS, 1 RCAS
 };
 
@@ -102,8 +103,10 @@ inline DittoCb dittoFillConstants(const DittoEval& in) {
     k.autoReactive = in.hasReactive ? 0.0f : 0.5f;
     const float hr = k.ratio <= 2.0f ? 0.0f : k.ratio >= 3.0f ? 1.0f : k.ratio - 2.0f;
     k.historySharpen = 0.03f + 0.02f * hr;
-    float as = 0.6f - 0.15f * hr;
+    // Below zero is DittoSR's Auto: 0.6 up to 2x, easing to 0.45 by 3x. A set value is used as given, and never above 0.9.
+    float as = in.antiShimmer >= 0.0f ? in.antiShimmer : 0.6f - 0.15f * hr;
     if (as > 0.9f) as = 0.9f;
+    if (as < 0.0f) as = 0.0f;
     k.antiShimmer = as;
     k.fusedSharpen = in.sharpenMode == 0 && k.ratio <= 2.55f ? 1.0f : 0.0f;
     k.rampLo = 0.25f;

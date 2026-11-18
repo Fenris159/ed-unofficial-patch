@@ -563,13 +563,13 @@ const std::string& shownValue(const char* section, const char* key) {
 
 bool flatAntiAliasingIsXess() { return _stricmp(shownValue("fix", "temporal_aa").c_str(), "xess") == 0; }
 
-// fix.dittosr_sharpness, fix.dittosr_frame_weight and fix.dittosr_sharpen. They stay on the Performance page, like the DLSS
-// preset, and dim until Anti-aliasing is DittoSR. The mode is the value the panel shows, so the rows light up on the same
-// change that selects DittoSR, before the ini write reaches Config.
+// fix.dittosr_sharpness, fix.dittosr_frame_weight, fix.dittosr_anti_shimmer and fix.dittosr_sharpen. They stay on the
+// Performance page, like the DLSS preset, and dim until Anti-aliasing is DittoSR. The mode is the value the panel shows,
+// so the rows light up on the same change that selects DittoSR, before the ini write reaches Config.
 bool isDittoRow(const MenuRowDef& d) {
     return strcmp(d.section, "fix") == 0 &&
            (strcmp(d.key, "dittosr_sharpness") == 0 || strcmp(d.key, "dittosr_frame_weight") == 0 ||
-            strcmp(d.key, "dittosr_sharpen") == 0);
+            strcmp(d.key, "dittosr_anti_shimmer") == 0 || strcmp(d.key, "dittosr_sharpen") == 0);
 }
 
 bool antiAliasingIsDitto() { return _stricmp(shownValue("fix", "temporal_aa").c_str(), "dittosr") == 0; }

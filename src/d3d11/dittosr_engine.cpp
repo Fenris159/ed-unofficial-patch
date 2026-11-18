@@ -13,6 +13,7 @@
 
 #include <d3d11.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -429,6 +430,14 @@ bool dittoEvaluate(ID3D11DeviceContext* ctx, unsigned slot, ID3D11Texture2D* col
     ev.frameWeight = Config::get().getFloat("fix.dittosr_frame_weight", 2.0f);
     const std::string sharpen = Config::get().getString("fix.dittosr_sharpen", "cas");
     ev.sharpenMode = _stricmp(sharpen.c_str(), "rcas") == 0 ? 1 : 0;
+    const std::string shimmer = Config::get().getString("fix.dittosr_anti_shimmer", "auto");
+    if (_stricmp(shimmer.c_str(), "off") == 0) ev.antiShimmer = 0.0f;
+    else if (_stricmp(shimmer.c_str(), "auto") == 0 || shimmer.empty()) ev.antiShimmer = -1.0f;
+    else {
+        char* end = nullptr;
+        const float asked = strtof(shimmer.c_str(), &end);
+        ev.antiShimmer = (end && *end == 0) ? dittoClamp(asked, 0.0f, 0.9f) : -1.0f;
+    }
     const DittoCb packed = dittoFillConstants(ev);
 
     SavedCs saved;

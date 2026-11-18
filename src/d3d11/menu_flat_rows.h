@@ -37,6 +37,7 @@ inline constexpr FlatPageRow kFlatPageRows[] = {
     // DittoSR's picture controls, under the DLSS preset and dimmed unless Anti-aliasing is DittoSR (menu.cpp). `menu performance`, so VR's page has them too.
     {"fix", "dittosr_sharpness", FlatRowRead::Allowlist},
     {"fix", "dittosr_frame_weight", FlatRowRead::Allowlist},
+    {"fix", "dittosr_anti_shimmer", FlatRowRead::Allowlist},
     {"fix", "dittosr_sharpen", FlatRowRead::Allowlist},
     // XeSS Frame Generation (2026-11-12): flat only (`menu flat_performance`), dimmed unless the flat AA mode is XeSS (xessFgToggleRowDim), the frames
     // row dimmed as well while the toggle is off. The tab's order is edvr.ini's: they sit under the DLSS preset row there.

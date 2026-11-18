@@ -170,8 +170,13 @@ int main() {
         check(ultra.ratio == 3.0f && near(ultra.antiShimmer, 0.45f) && near(ultra.historySharpen, 0.05f) && near(ultra.shareFar, 0.1f) &&
                   near(ultra.envCap, 0.25f) && ultra.fusedSharpen == 0.0f && ultra.sharpenMode == 1.0f && ultra.frameWeight == 4.0f &&
                   ultra.sharpness == 0.0f && ultra.hdr == 1.0f && ultra.hasReactive == 1.0f && ultra.autoReactive == 0.0f &&
-                  ultra.autoExposure == 1.0f && ultra.hasExposure == 1.0f,
+                  ultra.autoExposure == 1.0f && ultra.hasExposure == 1.0f && near(ultra.antiShimmer, 0.45f),
               "DittoSR at 3x drops fused sharpening, clamps the tunables, and lets a game reactive mask replace its own");
+        edvr::DittoEval held = up;
+        held.antiShimmer = 0.4f;
+        check(near(edvr::dittoFillConstants(held).antiShimmer, 0.4f), "a set anti-shimmer strength is used as given");
+        held.antiShimmer = 0.0f;
+        check(edvr::dittoFillConstants(held).antiShimmer == 0.0f, "anti-shimmer off stays off where Auto would be 0.6");
     }
     check(!edvr::temporalModeEnabledFor("off", true) && !edvr::temporalModeEnabledFor("off", false) &&
           !edvr::temporalModeEnabledFor("bogus", true) && !edvr::temporalModeEnabledFor("bogus", false),

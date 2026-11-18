@@ -80,7 +80,8 @@ Anti-aliasing row of the Performance page, or set `fix.temporal_aa`:
   not used. Elite does not load AMD's FidelityFX DLL, which is what that
   loader replaces. While it is selected, the Performance page offers its
   sharpness (60 is the look it ships with), its frame weight (2; lower is
-  steadier) and its filter (CAS, or RCAS). Those rows stay on the page and
+  steadier), its anti-shimmer (Auto, Off, or 0.1 to 0.9) and its filter
+  (CAS, or RCAS). Those rows stay on the page and
   dim for every other anti-aliasing choice, the same way the DLSS preset
   dims unless DLSS is selected. They apply on the next frame. DittoSR's own
   F7 panel is not part of this build; ED-UP's F7 still toggles anti-aliasing
