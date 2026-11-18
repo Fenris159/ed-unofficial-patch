@@ -227,6 +227,7 @@ void gpuCensusEnd(ID3D11DeviceContext*, GpuCensusSection) noexcept {}
 bool dlaaAvailable(ID3D11Device*, const char**) { return true; }
 bool fsr3Available(ID3D11Device*, const char**) { return true; }
 bool dittoAvailable(ID3D11Device*, const char**) { return true; }
+void dittoReleaseFeatures() {}
 bool xessAvailable(ID3D11Device*, const char**) { return false; }
 void xessReleaseFeatures() {}
 void xessShutdown() {}

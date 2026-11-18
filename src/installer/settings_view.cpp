@@ -518,7 +518,10 @@ void applyValue(List* list, size_t rowIndex, const std::string& value) {
         // on install: the mirror exists so a game update between now and the
         // next install cannot take today's change with it.
         updateMirrorIni(list->model->gameDir(), list->mirrorDir);
-        if (aa) rebuildItems(list);
+        if (aa) {
+            rebuildItems(list);
+            updateScrollbar(list);
+        }
     }
     InvalidateRect(list->hwnd, nullptr, TRUE);
 }

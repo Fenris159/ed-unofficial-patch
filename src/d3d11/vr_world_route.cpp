@@ -20,6 +20,7 @@
 #include "flat_camera_inject.h"    // stage 2: the camera injector's VR mode
 #include "flat_camera_phase.h"     // flatCameraCheckRowPair: the rows carry the phases they are claimed to
 #include "flat_live_phase.h"       // FlatLivePhase: the flat profile's phase machine, reused
+#include "dittosr_engine.h"   // dittoReleaseFeatures: the world slot, released when the choice leaves DittoSR
 #include "dlaa.h"
 #include "flat_mono_resolve.h"
 #include "gpu_census.h"
@@ -681,6 +682,18 @@ void windDownInjector() {
 }
 }  // namespace
 
+// The eye route does not run while this route owns the frame (native_temporal.cpp layerOnlyTreat
+// returns before the pass), so the pass's engine change never sees a DittoSR choice that only the
+// world slot used. The next accounted boundary drops those histories. An idle key-off frame returns
+// before this and reads no setting.
+void releaseDittoWhenLeft() {
+    const std::string mode = Config::get().getString("fix.temporal_aa", "off");
+    const bool ditto = _stricmp(mode.c_str(), "dittosr") == 0;
+    static bool wasDitto = false;
+    if (wasDitto && !ditto) dittoReleaseFeatures();
+    wasDitto = ditto;
+}
+
 // ---- the frame boundary ------------------------------------------------------------------------------------------------------------
 void vrWorldRouteFrameBoundary() {
     // The route is on in the DLL; only the rigs switch it off (vrWorldRouteSetEnabledForTest), to start a scenario from a cleared route.
@@ -693,6 +706,7 @@ void vrWorldRouteFrameBoundary() {
         g_ownsNext.store(false, std::memory_order_release);
         return;
     }
+    releaseDittoWhenLeft();
     ++g_frameNo;
 
     // The frame that ended. A curved screen (fix.panel_curvature above 0) does not hold the route off: the layer re-issues it through
