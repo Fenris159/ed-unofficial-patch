@@ -78,13 +78,13 @@ Anti-aliasing row of the Performance page, or set `fix.temporal_aa`:
   same colour, depth and motion, runs on any GPU, and is compiled into
   `d3d11.dll`, so there is nothing to download and DittoSR's own loader is
   not used. Elite does not load AMD's FidelityFX DLL, which is what that
-  loader replaces. Sharpness defaults to 0.6 (0 is softer, 1 is sharper),
-  frame weight to 2 (lower holds history longer, from 0.25 to 4), and the
-  sharpening filter to CAS. Set them under `[advanced]` as
-  `dittosr_sharpness`, `dittosr_frame_weight` and `dittosr_sharpen` (`cas` or
-  `rcas`). They apply on the next frame. DittoSR's in-game F7 panel is not
-  part of this build; ED-UP's F7 still toggles anti-aliasing off for a
-  comparison. Ditto Relight is not included.
+  loader replaces. While it is selected, the Performance page offers its
+  sharpness (60 is the look it ships with), its frame weight (2; lower is
+  steadier) and its filter (CAS, or RCAS). Those rows stay on the page and
+  dim for every other anti-aliasing choice, the same way the DLSS preset
+  dims unless DLSS is selected. They apply on the next frame. DittoSR's own
+  F7 panel is not part of this build; ED-UP's F7 still toggles anti-aliasing
+  off for a comparison. Ditto Relight is not included.
 - `xess` is Intel's XeSS-SR. It runs on any GPU and is fastest on an Intel Arc
   card. Elsewhere it costs more than DLSS or FSR: on an RTX 5090 in VR it took
   about 1.2 ms a frame more than DLSS. It needs Intel's runtime, `libxess.dll`,

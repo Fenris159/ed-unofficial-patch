@@ -425,9 +425,9 @@ bool dittoEvaluate(ID3D11DeviceContext* ctx, unsigned slot, ID3D11Texture2D* col
     ev.depthInverted = true;
     ev.hasReactive = reactiveSrv != nullptr;
     ev.autoExposure = ev.hdr;
-    ev.sharpness = Config::get().getFloat("advanced.dittosr_sharpness", 0.6f);
-    ev.frameWeight = Config::get().getFloat("advanced.dittosr_frame_weight", 2.0f);
-    const std::string sharpen = Config::get().getString("advanced.dittosr_sharpen", "cas");
+    ev.sharpness = Config::get().getFloat("fix.dittosr_sharpness", 0.6f);
+    ev.frameWeight = Config::get().getFloat("fix.dittosr_frame_weight", 2.0f);
+    const std::string sharpen = Config::get().getString("fix.dittosr_sharpen", "cas");
     ev.sharpenMode = _stricmp(sharpen.c_str(), "rcas") == 0 ? 1 : 0;
     const DittoCb packed = dittoFillConstants(ev);
 

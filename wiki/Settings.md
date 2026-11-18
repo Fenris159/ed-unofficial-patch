@@ -53,16 +53,7 @@ In a headset, **HMD Image Quality** is the size the game renders. Below 1.0 the 
 
 [The full upscaler notes](https://github.com/characterecho-sean/ed-unofficial-patch/blob/main/docs/fixes.md#upscaling-dlss-fsr-dittosr-and-xess).
 
-DittoSR's sharpness, frame weight and sharpening filter are optional lines under `[advanced]` in `edvr.ini` or `edvr-flat.ini`. They are not rows on F8. The defaults are sharpness `0.6`, frame weight `2` and sharpening `cas` (`rcas` is the other filter).
-
-```
-[advanced]
-dittosr_sharpness = 0.6
-dittosr_frame_weight = 2
-dittosr_sharpen = cas
-```
-
-A change applies on the next frame. Lower frame weight holds the previous frames longer. Sharpness `0` is soft and `1` is sharp.
+Choosing DittoSR lights three rows under it: **DittoSR sharpness** (60 is the look it ships with), **DittoSR frame weight** (2; lower is steadier, higher is crisper), and **DittoSR filter** (CAS, or RCAS). They stay on the page for the other choices and do not respond until DittoSR is selected, the same way the DLSS preset waits for DLSS and frame generation waits for XeSS. ED-UP's **Sharpening** row is a separate pass after the upscaler. A change applies on the next frame.
 
 ### Frame generation on a monitor
 

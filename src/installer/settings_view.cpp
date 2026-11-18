@@ -105,13 +105,15 @@ void rebuildItems(List* list) {
 
     const std::vector<SettingRow>& rows = list->model->rows();
 
-    // fsr ignores fix.temporal_aa_model (NVIDIA's preset row): found fresh
-    // each rebuild.
+    // NVIDIA's preset row is hidden for FSR and DittoSR. DittoSR's own rows are
+    // shown only while DittoSR is the anti-aliasing. Found fresh each rebuild.
     bool hideAaPreset = false;
+    bool showDitto = false;
     for (const SettingRow& r : rows) {
         if (isVscreenKey(*r.def, "temporal_aa")) {
             hideAaPreset = _stricmp(effectiveValue(r).c_str(), "fsr") == 0 ||
                            _stricmp(effectiveValue(r).c_str(), "dittosr") == 0;
+            showDitto = _stricmp(effectiveValue(r).c_str(), "dittosr") == 0;
             break;
         }
     }
@@ -119,6 +121,9 @@ void rebuildItems(List* list) {
     for (size_t i = 0; i < rows.size(); ++i) {
         if (!matches(rows[i], needle)) continue;
         if (hideAaPreset && isVscreenKey(*rows[i].def, "temporal_aa_model")) continue;
+        if (!showDitto && (isVscreenKey(*rows[i].def, "dittosr_sharpness") ||
+                           isVscreenKey(*rows[i].def, "dittosr_frame_weight") ||
+                           isVscreenKey(*rows[i].def, "dittosr_sharpen"))) continue;
         const std::wstring wanted = headingFor(*rows[i].def);
         if (!haveHeading || wanted != heading) {
             heading = wanted;
