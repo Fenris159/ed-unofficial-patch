@@ -121,11 +121,11 @@ minutes after a flight finally reproduced the effect being chased.
 
 ## Kilo code review
 
-A request for a Kilo code review runs locally with the `code-reviewer` agent:
+A request for a Kilo code review runs locally with the `code-reviewer` agent. That agent is not built into the CLI. It is the local file `~/.config/kilo/agents/code-reviewer.md`, with `mode: primary` and `id: code-reviewer`. Without that file the command has no agent to run.
 
 `kilo run --agent code-reviewer --auto --model kilo/openai/gpt-6.1-sol --variant xhigh`
 
-That is Kilo’s OpenAI ChatGPT-subscription connection through the Kilo Gateway, model `kilo/openai/gpt-6.1-sol`, extra-high reasoning (`xhigh`). Before the run, `kilo models kilo --verbose` for that model shows `hasUserByokAvailable: true`, `ai_sdk_provider: openai`, and an `xhigh` variant, and `/home/drew/.local/state/kilo/model.json` selects it. An empty `byok.list` does not mean the connection is down. A routing check uses `byok.previewRouting` with `apiKind: responses`. The CLI’s separate `openai` OAuth provider is not this connection. The review reads the branch and does not edit it. Fix the concrete findings it reports. If that connection is unavailable, name the blocker and stop; do not switch model, provider, or reasoning level.
+That is Kilo’s OpenAI ChatGPT-subscription connection through the Kilo Gateway, model `kilo/openai/gpt-6.1-sol`, extra-high reasoning (`xhigh`). Before the run, `kilo models kilo --verbose` for that model shows `hasUserByokAvailable: true`, `ai_sdk_provider: openai`, and an `xhigh` variant, and `~/.local/state/kilo/model.json` selects it. An empty `byok.list` does not mean the connection is down. A routing check uses `byok.previewRouting` with `apiKind: responses`. The CLI’s separate `openai` OAuth provider is not this connection. The review reads the branch and does not edit it. Fix the concrete findings it reports. If that connection is unavailable, name the blocker and stop; do not switch model, provider, or reasoning level.
 
 ## Diagnosis discipline
 

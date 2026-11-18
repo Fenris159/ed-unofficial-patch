@@ -1,6 +1,6 @@
 # Third-party notices
 
-DittoSR includes or derives from the following. Binary releases ship this file and the `licenses/` folder.
+DittoSR includes or derives from the following. An ED-UP release does not ship this file or the `licenses/` folder. It carries the MIT notice as `DITTOSR-LICENSE.txt` and the Snapdragon notice as `DITTOSR-GSR-LICENSE.txt`, both beside `d3d11.dll`. The table below is the upstream attribution.
 
 | Component | Where | License |
 |---|---|---|

@@ -3027,6 +3027,8 @@ void buildContent(MenuContent& c) {
                         }
                         body += "\nPress R again to remove this headset's entry (back to " + fallback + ").";
                     }
+                } else if (dim && dittoRow) {
+                    body += std::string("\n") + dittoRowHint();
                 } else if (dim) {
                     body += "\nInactive: only DLSS and DLAA read this preset.";
                 } else if (s.resetArmedEntry == i) {

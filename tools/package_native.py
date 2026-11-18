@@ -96,6 +96,12 @@ FILES = (
                  "OPENXR-LOADER-LICENSE.txt", _VR, "replace"),
     PackagedFile("settings_vr", "edvr.ini", "core", "game", "edvr.ini", _VR, "settings"),
     PackagedFile("settings_flat", "edvr-flat.ini", "core", "game", "edvr-flat.ini", _FLAT, "settings"),
+    # DittoSR is inside d3d11.dll, so these notices are manifest files, not extra
+    # zip members: the launcher installs a manifest file and would otherwise
+    # copy the DLL without them.
+    PackagedFile("dittosr_license", "DITTOSR-LICENSE.txt", "core", "game", "DITTOSR-LICENSE.txt", _EITHER, "owned"),
+    PackagedFile("dittosr_gsr_license", "DITTOSR-GSR-LICENSE.txt", "core", "game",
+                 "DITTOSR-GSR-LICENSE.txt", _EITHER, "owned"),
     PackagedFile("dlss", "nvngx_dlss.dll", "dlss", "game", "nvngx_dlss.dll", _NVIDIA, "owned"),
     PackagedFile("xess", "libxess.dll", "xess", "game", "libxess.dll", None, "owned"),
     PackagedFile("xess_license", "INTEL-XESS-LICENSE.txt", "xess", "game", "INTEL-XESS-LICENSE.txt", None, "owned"),
@@ -107,8 +113,7 @@ FILES = (
 # Members that ship in a zip without an entry in the manifest's files: notices, and the profile
 # descriptor, which the planner no longer reads (it writes its own).
 _EXTRA_MEMBERS = {"core": ("edvr_profile.ini", "LICENSE.txt", "DXBC-HASH-LICENSE.txt", "MINIZ-LICENSE.txt",
-                           "FIDELITYFX-SDK-DX11-LICENSE.txt", "DITTOSR-LICENSE.txt", "DITTOSR-GSR-LICENSE.txt",
-                           "MIN-ED-LAUNCHER-LICENSE.txt"),
+                           "FIDELITYFX-SDK-DX11-LICENSE.txt", "MIN-ED-LAUNCHER-LICENSE.txt"),
                   "dlss": ("NVIDIA-DLSS-LICENSE.txt",), "xess": ()}
 
 
