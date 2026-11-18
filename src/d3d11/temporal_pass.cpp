@@ -4647,6 +4647,11 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                     "temporal aa: xess was asked for, but the game submits %s and XeSS is "
                     "handed R8G8B8A8, a different family. The pass's own history runs instead.",
                     formatName(sd.Format));
+            } else if (dittoEngine) {
+                Log::get().note(
+                    "temporal aa: dittosr was asked for, but the game submits %s and DittoSR is "
+                    "handed R8G8B8A8, a different family. The pass's own history runs instead.",
+                    formatName(sd.Format));
             } else {
                 Log::get().note(
                     "temporal aa: dlaa was asked for, but the game submits %s and NVIDIA is "
