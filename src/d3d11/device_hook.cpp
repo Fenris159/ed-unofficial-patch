@@ -37,6 +37,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "../common/d3d11_device_slots.h"   // kDevSlotCheckFormatSupport / kDevSlotCheckFeatureSupport
 #include "../common/format_query_log.h"     // formatHooksInstalledLine: the one line that says the hooks went on
 #include "../common/temporal_mode.h"
+#include "../common/texture_lod_bias.h"
 #include "../common/runtime_profile.h"
 #include "../common/frame_flag.h"
 #include "hmd_reset_press.h"   // hmdResetPressFrame: the players HMD recentre key, watched for the seat memory
@@ -2560,13 +2561,13 @@ void logContextTableVariants(void** table, size_t span, const char* who) {
 // would bias only the stragglers, which is a feature that does almost
 // nothing and says nothing about it.
 //
-// So take it from the game's own settings, which are written before it
-// starts: Options\Graphics\<preset>.<major>.<minor>.fxcfg carries
-// <HMDRenderTargetMultiplier>, the fraction of the runtime's recommended
-// size Elite renders at. The newest .fxcfg is the one it last wrote.
-// SSAAMultiplier is read alongside only to be reported, so that if the
-// bias ever disagrees with the render size in the log, the second number
-// is already there to explain it.
+// So take it from the game's own active graphics preset, which is written before it
+// starts: Settings.xml names <PresetName>, resolving Custom to the highest-versioned
+// Options\Graphics\Custom.<major>.<minor>.fxcfg and stock presets to
+// <gameDir>\OptionDefaults\<Preset>.fxcfg (falling back to the newest *.fxcfg only
+// when Settings.xml is absent or names no preset) (#253).
+// <HMDRenderTargetMultiplier> is the VR render scale; <SSAAMultiplier> is the flat
+// render scale. Both are parsed together so logs carry both numbers.
 //
 // A format this file does not control, so every failure is silent-safe:
 // no directory, no file, no field, or an unreasonable value all leave the
@@ -2578,54 +2579,69 @@ bool eliteHmdMultiplier(float* mult, float* ssaa, char* fileOut, size_t fileLen)
     wchar_t appdata[MAX_PATH] = {};
     const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", appdata, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return false;
-    std::wstring dir = std::wstring(appdata) +
-                       L"\\Frontier Developments\\Elite Dangerous\\Options\\Graphics\\";
-    WIN32_FIND_DATAW fd = {};
-    HANDLE h = FindFirstFileW((dir + L"*.fxcfg").c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    std::wstring best;
-    FILETIME bestTime = {};
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        if (best.empty() || CompareFileTime(&fd.ftLastWriteTime, &bestTime) > 0) {
-            best = fd.cFileName;
-            bestTime = fd.ftLastWriteTime;
+    const std::wstring dir = std::wstring(appdata) +
+                             L"\\Frontier Developments\\Elite Dangerous\\Options\\Graphics\\";
+    const std::wstring gameDir = executableDirectory();
+    auto readSmall = [](const std::wstring& path, std::string* out) -> bool {
+        if (out) out->clear();
+        HANDLE f = CreateFileW(path.c_str(), GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) return false;
+        const DWORD size = GetFileSize(f, nullptr);
+        bool ok = false;
+        if (size != INVALID_FILE_SIZE && size <= (1u << 20)) {
+            std::string buf(size, '\0');
+            DWORD got = 0;
+            if (size == 0 || (ReadFile(f, &buf[0], size, &got, nullptr) && got == size)) {
+                if (out) *out = std::move(buf);
+                ok = true;
+            }
         }
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    if (best.empty()) return false;
-    HANDLE f = CreateFileW((dir + best).c_str(), GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return false;
-    const DWORD size = GetFileSize(f, nullptr);
-    std::string text;
-    if (size != INVALID_FILE_SIZE && size <= (1u << 20)) {
-        text.resize(size);
-        DWORD got = 0;
-        if (!ReadFile(f, &text[0], size, &got, nullptr)) got = 0;
-        text.resize(got);
+        CloseHandle(f);
+        return ok;
+    };
+    std::string source;
+    const bool gotHmd = resolveActivePresetMultipliers(
+        [&](std::string* out) { return readSmall(dir + L"Settings.xml", out); },
+        [&](const std::string& preset, std::string* out) {
+            if (gameDir.empty()) return false;
+            return readSmall(gameDir + L"\\OptionDefaults\\" +
+                                 std::wstring(preset.begin(), preset.end()) + L".fxcfg",
+                             out);
+        },
+        [&](const std::string& name, std::string* out) {
+            const int wlen = MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, nullptr, 0);
+            if (wlen <= 1) return false;
+            std::wstring wname(static_cast<size_t>(wlen - 1), L'\0');
+            if (MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, &wname[0], wlen) <= 0) return false;
+            return readSmall(dir + wname, out);
+        },
+        [&]() {
+            std::vector<PresetFxcfgEntry> entries;
+            WIN32_FIND_DATAW fd = {};
+            HANDLE h = FindFirstFileW((dir + L"*.fxcfg").c_str(), &fd);
+            if (h == INVALID_HANDLE_VALUE) return entries;
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                char utf8[MAX_PATH] = {};
+                if (WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, utf8,
+                                        static_cast<int>(sizeof(utf8)), nullptr, nullptr) > 0) {
+                    PresetFxcfgEntry e;
+                    e.name = utf8;
+                    e.mtime = (static_cast<uint64_t>(fd.ftLastWriteTime.dwHighDateTime) << 32) |
+                              fd.ftLastWriteTime.dwLowDateTime;
+                    entries.push_back(std::move(e));
+                }
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+            return entries;
+        },
+        mult, ssaa, &source);
+    if (!source.empty() && fileOut && fileLen) {
+        snprintf(fileOut, fileLen, "%s", source.c_str());
     }
-    CloseHandle(f);
-    if (text.empty()) return false;
-    if (fileOut && fileLen) {
-        const int w = WideCharToMultiByte(CP_UTF8, 0, best.c_str(), -1, fileOut,
-                                          static_cast<int>(fileLen), nullptr, nullptr);
-        if (w <= 0) fileOut[0] = 0;
-    }
-    struct Field { const char* tag; float* out; };
-    const Field fields[] = {{"<HMDRenderTargetMultiplier>", mult}, {"<SSAAMultiplier>", ssaa}};
-    bool gotMult = false;
-    for (const Field& fl : fields) {
-        if (!fl.out) continue;
-        const size_t at = text.find(fl.tag);
-        if (at == std::string::npos) continue;
-        const float v = static_cast<float>(atof(text.c_str() + at + strlen(fl.tag)));
-        if (!(v > 0.0f) || !(v < 8.0f)) continue;
-        *fl.out = v;
-        if (fl.out == mult) gotMult = true;
-    }
-    return gotMult;
+    return gotHmd;
 }
 
 bool deviceHookFxcfgMultipliers(float* mult, float* ssaa, char* fileOut, size_t fileLen) {
@@ -2954,41 +2970,31 @@ void hookDevice(ID3D11Device* device) {
     vrSsaaGateStartup();  // log only: the 3D mode file, the .fxcfg's Supersampling and HMD Quality, once per process
     {
         const int aniso = sentinelCfg.getIntInRange("advanced.texture_anisotropy", 0, 0, 16);
-        const bool temporal = temporalModeEnabledFor(sentinelCfg.getString("fix.temporal_aa", "off"), runtimeFlatProfile());
-        const std::string biasKey = sentinelCfg.getString("advanced.texture_lod_bias", temporal ? "auto" : "0");
-        float bias = 0.0f;
+        const bool flat = runtimeFlatProfile();
+        const std::string biasKey = readTextureLodBiasKey(sentinelCfg, flat);
+        float mult = 0.0f, ssaa = 0.0f;
+        char file[80] = {};
         if (_stricmp(biasKey.c_str(), "auto") == 0) {
-            float mult = 0.0f, ssaa = 0.0f;
-            char file[80] = {};
-            if (eliteHmdMultiplier(&mult, &ssaa, file, sizeof(file))) {
-                bias = log2f(mult);
-                s.samplerBiasAuto = true;
-                s.samplerBiasMult = mult;
-                snprintf(s.samplerBiasWhy, sizeof(s.samplerBiasWhy),
-                         "auto: Elite renders at %.3f of the size the runtime recommends "
-                         "(HMDRenderTargetMultiplier in %s; its SSAAMultiplier is %.3f), and "
-                         "log2 of that is the bias the mips want",
-                         static_cast<double>(mult), file[0] ? file : "its graphics preset",
-                         static_cast<double>(ssaa));
-            } else {
-                // Say it here rather than leave it to the sampler line: a
-                // failed auto leaves the bias at zero, which switches the
-                // whole override off, which would print nothing at all.
-                Log::get().note(
-                    "texture filtering: advanced.texture_lod_bias = auto, but Elite's graphics "
-                    "preset gave no HMDRenderTargetMultiplier (Options\\Graphics\\*.fxcfg under "
-                    "%%LOCALAPPDATA%%\\Frontier Developments\\Elite Dangerous). No bias is applied. "
-                    "Set a number instead, or check the game has written its settings once.");
-            }
-        } else {
-            bias = static_cast<float>(atof(biasKey.c_str()));
-            snprintf(s.samplerBiasWhy, sizeof(s.samplerBiasWhy),
-                     "advanced.texture_lod_bias = %s", biasKey.c_str());
+            (void)eliteHmdMultiplier(&mult, &ssaa, file, sizeof(file));
         }
-        if (!(bias > -4.0f)) bias = -4.0f;
-        if (!(bias < 4.0f)) bias = 4.0f;
+        const TextureLodBiasResult resolved =
+            resolveTextureLodBias(flat, biasKey, mult, ssaa, file);
+        if (resolved.autoMissing) {
+            // Say it here rather than leave it to the sampler line: a
+            // failed auto leaves the bias at zero, which switches the
+            // whole override off, which would print nothing at all.
+            Log::get().note(
+                "texture filtering: advanced.texture_lod_bias = auto, but Elite's graphics "
+                "preset gave no %s (Options\\Graphics\\*.fxcfg under "
+                "%%LOCALAPPDATA%%\\Frontier Developments\\Elite Dangerous). No bias is applied. "
+                "Set a number instead, or check the game has written its settings once.",
+                flat ? "SSAAMultiplier" : "HMDRenderTargetMultiplier");
+        }
+        s.samplerBiasAuto = resolved.isAuto;
+        s.samplerBiasMult = resolved.activeMult;
+        snprintf(s.samplerBiasWhy, sizeof(s.samplerBiasWhy), "%s", resolved.why);
         s.samplerAniso = aniso;
-        s.samplerBias = bias;
+        s.samplerBias = resolved.bias;
     }
     s.deviceHook.replace(kDevCreateSamplerState, &hookedCreateSamplerState,
                          reinterpret_cast<void**>(&s.realCreateSamplerState));

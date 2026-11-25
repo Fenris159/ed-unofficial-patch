@@ -56,6 +56,7 @@
 #include "../../src/common/runtime_profile.h"
 #include "../../src/common/star_glow.h"
 #include "../../src/common/temporal_mode.h"
+#include "../../src/common/texture_lod_bias.h"
 #include "../../src/common/log.h"
 #include "../../src/d3d11/native_on_foot_f162.h"   // F162: the ADS sight eye key's text (a header with no dependencies)
 #include "config_contract_gen.h"   // build\gen: the tables the DLLs register, from the real edup.ini
@@ -3148,6 +3149,61 @@ int main(int argc, char** argv) {
             if (Config::get().getInt("advanced.temporal_aa_jitter_phases", 8) == 8)
                 ok("flat jitter cycle uses the 8 default when absent");
             else fail("flat jitter cycle default", "missing key was refused");
+            // Issue #253: flat profile reads advanced.texture_lod_bias and derives its default ("auto" vs "0")
+            // through readTextureLodBiasKey() from requestedTemporalMode() (never the refused VR fix.temporal_aa key).
+            if (Config::get().getString("advanced.texture_lod_bias", "auto") == "auto")
+                ok("flat texture_lod_bias uses the auto default when absent");
+            else fail("flat texture_lod_bias default",
+                      std::string("got ") + Config::get().getString("advanced.texture_lod_bias", "auto"));
+            const struct { const char* aa; const char* want; } lodDefaults[] = {
+                {"fsr4", "auto"}, {"xess", "auto"}, {"dlss", "auto"}, {"on", "auto"}, {"off", "0"},
+            };
+            bool lodDefaultsOk = true;
+            for (const auto& tc : lodDefaults) {
+                if (!rewriteIni(scratch, std::string("[fix]\r\ntemporal_aa = ") + tc.aa + "\r\n") ||
+                    !Config::get().reloadIfChanged() ||
+                    edvr::readTextureLodBiasKey(Config::get(), true) != tc.want) {
+                    lodDefaultsOk = false;
+                    fail("flat texture_lod_bias temporal default",
+                         std::string("aa=") + tc.aa + " got " + edvr::readTextureLodBiasKey(Config::get(), true));
+                }
+            }
+            if (lodDefaultsOk) ok("flat readTextureLodBiasKey derives auto/0 from requestedTemporalMode (fsr4/xess/dlss/on/off)");
+            // Issue #253 live switch: "auto" in VR (HMD=0.5 -> -1.00) vs "auto" in flat (SSAA=1.0 -> 0.00)
+            // must compare as different effective mip biases with whitespace-free KEPT_ITEM labels.
+            {
+                const auto vrAuto = edvr::effectiveTextureLodBias(false, "auto", 0.5f, 1.0f);
+                const auto flatAuto = edvr::effectiveTextureLodBias(true, "auto", 0.5f, 1.0f);
+                const auto flatZero = edvr::effectiveTextureLodBias(true, "0", 0.5f, 1.0f);
+                const auto vrExplicitA = edvr::effectiveTextureLodBias(false, "-1", 0.5f, 1.0f);
+                const auto vrExplicitB = edvr::effectiveTextureLodBias(false, " -1.0 ", 0.5f, 1.0f);
+                const auto vrMissing = edvr::effectiveTextureLodBias(false, "auto", 0.0f, 0.0f);
+                const auto flatMissing = edvr::effectiveTextureLodBias(true, "auto", 0.0f, 0.0f);
+                const bool labelsClean = vrAuto.label == "auto(-1.00)" && flatAuto.label == "auto(0.00)" &&
+                                         flatZero.label == "0" && vrExplicitB.label == "-1.0" &&
+                                         vrMissing.label == "auto" &&
+                                         vrAuto.label.find(' ') == std::string::npos &&
+                                         flatAuto.label.find(' ') == std::string::npos;
+                if (labelsClean &&
+                    !edvr::sameEffectiveTextureLodBias(vrAuto, flatAuto) &&
+                    edvr::sameEffectiveTextureLodBias(flatAuto, flatZero) &&
+                    edvr::sameEffectiveTextureLodBias(vrExplicitA, vrExplicitB) &&
+                    !edvr::sameEffectiveTextureLodBias(vrMissing, flatZero) &&
+                    edvr::sameEffectiveTextureLodBias(vrMissing, flatMissing)) {
+                    ok("effectiveTextureLodBias compares resolved VR/flat auto biases and emits whitespace-free KEPT_ITEM labels");
+                } else {
+                    fail("effectiveTextureLodBias",
+                         "vr=" + vrAuto.label + " flat=" + flatAuto.label + " expB=" + vrExplicitB.label);
+                }
+            }
+            // Restore original scratch ini so later checks see the expected baseline.
+            (void)rewriteIni(scratch, "[fix]\r\nblack_void = on\r\n");
+            (void)Config::get().reloadIfChanged();
+            // Issue #254: every profile reads advanced.context_hook_mode (default "auto" when absent, no false IGNORED).
+            if (Config::get().getString("advanced.context_hook_mode", "auto") == "auto")
+                ok("flat context_hook_mode uses the auto default when absent");
+            else fail("flat context_hook_mode default",
+                      std::string("got ") + Config::get().getString("advanced.context_hook_mode", "auto"));
             if (Config::get().getBool("advanced.input_gate", true))
                 ok("flat input_gate uses true default when absent");
             else fail("flat input_gate default", "missing key was not true");
@@ -3189,6 +3245,14 @@ int main(int argc, char** argv) {
     expectInt("advanced.temporal_aa_jitter_phases", 32, "flat scope permits the jitter cycle's key");
     Config::get().set("advanced.temporal_aa_jitter_phases", "8");
     expectInt("advanced.temporal_aa_jitter_phases", 8, "flat scope reads the jitter cycle's key at its default");
+    // Issues #253 & #254: explicit overrides in flat profile.
+    Config::get().set("advanced.texture_lod_bias", "-0.75");
+    expectStr("advanced.texture_lod_bias", "-0.75", "flat scope reads explicit advanced.texture_lod_bias");
+    Config::get().set("advanced.context_hook_mode", "shared");
+    expectStr("advanced.context_hook_mode", "shared", "flat scope reads explicit advanced.context_hook_mode = shared");
+    Config::get().set("advanced.context_hook_mode", "live");
+    expectStr("advanced.context_hook_mode", "live", "flat scope reads explicit advanced.context_hook_mode = live");
+    Config::get().set("advanced.context_hook_mode", "auto");
     // The VR camera census's key is a VR-profile key too: a flat profile must never install its hook.
     Config::get().set("advanced.vr_camera_census", "on");
     expectStr("advanced.vr_camera_census", "off", "flat scope refuses the VR camera census's key");
@@ -3257,6 +3321,14 @@ int main(int argc, char** argv) {
     expectStr("advanced.real_dll", "d3d11_edhm.dll", "bad descriptor preserves mod chaining");
     Config::get().set("advanced.temporal_aa_jitter_phases", "32");
     expectInt("advanced.temporal_aa_jitter_phases", 0, "invalid profile refuses the flat jitter cycle's key");
+    Config::get().set("advanced.texture_lod_bias", "-0.5");
+    expectStr("advanced.texture_lod_bias", "off", "invalid profile refuses advanced.texture_lod_bias");
+    Config::get().set("advanced.context_hook_mode", "shared");
+    expectStr("advanced.context_hook_mode", "shared", "invalid profile still permits advanced.context_hook_mode");
+    g_runtimeProfile = RuntimeProfile::Passthrough;
+    expectStr("advanced.texture_lod_bias", "off", "passthrough profile refuses advanced.texture_lod_bias");
+    expectStr("advanced.context_hook_mode", "shared", "passthrough profile permits advanced.context_hook_mode");
+    g_runtimeProfile = RuntimeProfile::Invalid;
     Config::get().set("advanced.vr_camera_census", "on");
     expectStr("advanced.vr_camera_census", "off", "invalid profile cannot turn the VR camera census on");
     g_runtimeProfile = RuntimeProfile::LegacyVr;
@@ -3281,14 +3353,16 @@ int main(int argc, char** argv) {
         // The descriptor beside the inis is what makes init() pick the flat file:
         // without it the profile reads as the legacy VR one and edup.ini wins.
         if (!writeIni(flatDir, descriptor, L"edup_profile.ini") ||
-            !rewriteIni(flatDir, "[fix]\r\nrender_sharpness = 0.9\r\n") ||
-            !rewriteIni(flatDir, "[fix]\r\nrender_sharpness = 0.4\r\n[diag]\r\nflat_origin_capture = on\r\n", flatLeaf)) {
+            !rewriteIni(flatDir, "[fix]\r\nrender_sharpness = 0.9\r\n[advanced]\r\ntexture_lod_bias = -0.25\r\ncontext_hook_mode = private\r\n") ||
+            !rewriteIni(flatDir, "[fix]\r\nrender_sharpness = 0.4\r\n[diag]\r\nflat_origin_capture = on\r\n[advanced]\r\ntexture_lod_bias = -0.75\r\ncontext_hook_mode = shared\r\n", flatLeaf)) {
             fail("flat sharpening reload", "could not write the scratch inis");
         } else {
             pinGraphicsMode(flatDir + L"_localappdata", 0);
             Config::get().init(flatDir);
             if (!runtimeFlatProfile()) fail("flat sharpening reload", "the descriptor did not select flat");
             expectBool("diag.flat_origin_capture", true, "flat profile permits explicit F1 diagnostic opt-in");
+            expectStr("advanced.texture_lod_bias", "-0.75", "edup-flat.ini overrides advanced.texture_lod_bias");
+            expectStr("advanced.context_hook_mode", "shared", "edup-flat.ini overrides advanced.context_hook_mode");
             expectFloat("fix.render_sharpness", 0.4f,
                         "the flat file is read first: its 0.4, not edup.ini's 0.9");
             if (!rewriteIni(flatDir, "[fix]\r\nrender_sharpness = 0\r\n", flatLeaf) ||
@@ -3352,6 +3426,163 @@ int main(int argc, char** argv) {
         }
     }
     g_runtimeProfile = savedProfile;
+
+    // Issue #253: pure texture_lod_bias derivation for VR (HMDRenderTargetMultiplier) and flat (SSAAMultiplier).
+    {
+        float hmd = -1.0f, ssaa = -1.0f;
+        const bool gotBoth = edvr::parseFxcfgMultipliers(
+            "<GraphicsOptions><HMDRenderTargetMultiplier>1.25</HMDRenderTargetMultiplier>"
+            "<SSAAMultiplier>0.75</SSAAMultiplier></GraphicsOptions>", &hmd, &ssaa);
+        check(gotBoth && std::abs(hmd - 1.25f) < 1e-5f && std::abs(ssaa - 0.75f) < 1e-5f,
+              "parseFxcfgMultipliers parses both HMDRenderTargetMultiplier and SSAAMultiplier");
+
+        const auto flatAuto = edvr::resolveTextureLodBias(true, "auto", hmd, ssaa, "Custom.4.4.fxcfg");
+        check(flatAuto.isAuto && !flatAuto.autoMissing && std::abs(flatAuto.activeMult - 0.75f) < 1e-5f &&
+                  std::abs(flatAuto.bias - std::log2(0.75f)) < 1e-5f &&
+                  std::strstr(flatAuto.why, "SSAAMultiplier in Custom.4.4.fxcfg") != nullptr &&
+                  std::strstr(flatAuto.why, "0.750") != nullptr,
+              "flat texture_lod_bias=auto derives log2(SSAAMultiplier) (~-0.415 at 0.75)");
+
+        const auto vrAuto = edvr::resolveTextureLodBias(false, "auto", hmd, ssaa, "Custom.4.4.fxcfg");
+        check(vrAuto.isAuto && !vrAuto.autoMissing && std::abs(vrAuto.activeMult - 1.25f) < 1e-5f &&
+                  std::abs(vrAuto.bias - std::log2(1.25f)) < 1e-5f &&
+                  std::strstr(vrAuto.why, "HMDRenderTargetMultiplier in Custom.4.4.fxcfg") != nullptr &&
+                  std::strstr(vrAuto.why, "1.250") != nullptr,
+              "VR texture_lod_bias=auto derives log2(HMDRenderTargetMultiplier)");
+
+        // Flat .fxcfg containing only SSAAMultiplier (no HMDRenderTargetMultiplier): parse returns false for HMD,
+        // populates ssaa, and flat auto still derives log2(0.5) = -1.0.
+        float onlyHmd = -1.0f, onlySsaa = -1.0f;
+        const bool gotHmdOnly = edvr::parseFxcfgMultipliers(
+            "<GraphicsOptions><SSAAMultiplier>0.5</SSAAMultiplier></GraphicsOptions>", &onlyHmd, &onlySsaa);
+        const auto flatSsaaOnly = edvr::resolveTextureLodBias(true, "auto", onlyHmd, onlySsaa, "Custom.4.4.fxcfg");
+        check(!gotHmdOnly && onlyHmd == 0.0f && std::abs(onlySsaa - 0.5f) < 1e-5f &&
+                  flatSsaaOnly.isAuto && !flatSsaaOnly.autoMissing && std::abs(flatSsaaOnly.bias - (-1.0f)) < 1e-5f,
+              "flat texture_lod_bias=auto works when .fxcfg has SSAAMultiplier without HMDRenderTargetMultiplier");
+
+        // Flat .fxcfg with HMDRenderTargetMultiplier only (no SSAAMultiplier): must report autoMissing and bias 0,
+        // never log2(0) -> -4.0.
+        float hmdOnly = -1.0f, missingSsaa = -1.0f;
+        const bool gotHmd = edvr::parseFxcfgMultipliers(
+            "<GraphicsOptions><HMDRenderTargetMultiplier>1.0</HMDRenderTargetMultiplier></GraphicsOptions>",
+            &hmdOnly, &missingSsaa);
+        const auto flatMissingSsaa = edvr::resolveTextureLodBias(true, "auto", hmdOnly, missingSsaa, "Custom.4.4.fxcfg");
+        check(gotHmd && missingSsaa == 0.0f && !flatMissingSsaa.isAuto && flatMissingSsaa.autoMissing &&
+                  flatMissingSsaa.bias == 0.0f,
+              "flat texture_lod_bias=auto reports autoMissing and bias 0 when SSAAMultiplier is absent");
+
+        const auto flatUnity = edvr::resolveTextureLodBias(true, "auto", 0.5f, 1.0f, "Custom.4.4.fxcfg");
+        check(flatUnity.isAuto && flatUnity.bias == 0.0f, "flat SSAA=1.0 gives exact 0.0 bias");
+
+        const auto flatExplicit = edvr::resolveTextureLodBias(true, "-0.5", 1.0f, 1.0f, "Custom.4.4.fxcfg");
+        check(!flatExplicit.isAuto && !flatExplicit.autoMissing && std::abs(flatExplicit.bias - (-0.5f)) < 1e-5f,
+              "explicit numeric texture_lod_bias parses directly");
+
+        const auto clampedLow = edvr::resolveTextureLodBias(true, "-9.0", 1.0f, 1.0f, nullptr);
+        const auto clampedHigh = edvr::resolveTextureLodBias(true, "9.0", 1.0f, 1.0f, nullptr);
+        check(clampedLow.bias == -4.0f && clampedHigh.bias == 4.0f, "texture_lod_bias clamps to [-4, 4]");
+
+        // Active preset resolution (#253): Settings.xml <PresetName> picks OptionDefaults\<Preset>.fxcfg
+        // for stock presets and highest-versioned Custom.<major>.<minor>.fxcfg for Custom, ignoring stale
+        // leftover Custom files when a stock preset is active.
+        {
+            const std::vector<edvr::PresetFxcfgEntry> userFiles = {
+                {"Custom.4.3.fxcfg", 500},
+                {"Custom.4.4.fxcfg", 200},
+                {"Custom.4.4.fxcfg-backup", 999},
+                {"MyPreset.4.2.fxcfg", 300},
+            };
+            auto readUser = [&](const std::string& name, std::string* out) -> bool {
+                if (name == "Custom.4.3.fxcfg") {
+                    *out = "<GraphicsOptions><SSAAMultiplier>0.50</SSAAMultiplier><HMDRenderTargetMultiplier>0.75</HMDRenderTargetMultiplier></GraphicsOptions>";
+                    return true;
+                }
+                if (name == "Custom.4.4.fxcfg") {
+                    *out = "<GraphicsOptions><SSAAMultiplier>0.65</SSAAMultiplier><HMDRenderTargetMultiplier>1.25</HMDRenderTargetMultiplier></GraphicsOptions>";
+                    return true;
+                }
+                if (name == "MyPreset.4.2.fxcfg") {
+                    *out = "<GraphicsOptions><SSAAMultiplier>0.85</SSAAMultiplier><HMDRenderTargetMultiplier>1.00</HMDRenderTargetMultiplier></GraphicsOptions>";
+                    return true;
+                }
+                return false;
+            };
+            auto readStock = [&](const std::string& preset, std::string* out) -> bool {
+                if (preset == "Ultra") {
+                    *out = "<GraphicsOptions><SSAAMultiplier>1.00</SSAAMultiplier><HMDRenderTargetMultiplier>1.00</HMDRenderTargetMultiplier></GraphicsOptions>";
+                    return true;
+                }
+                return false;
+            };
+
+            // 1. Stock preset active (Ultra at 1.0) with leftover Custom.4.4.fxcfg (0.65): must use Ultra (1.0).
+            float pHmd = 0, pSsaa = 0;
+            std::string pSrc;
+            const bool okStock = edvr::resolveActivePresetMultipliers(
+                [](std::string* out) { *out = "<GraphicsOptions><!-- <PresetName>Custom</PresetName> --><PresetName>Ultra</PresetName></GraphicsOptions>"; return true; },
+                readStock, readUser, [&]() { return userFiles; }, &pHmd, &pSsaa, &pSrc);
+            check(okStock && pSrc == "OptionDefaults\\Ultra.fxcfg" && std::abs(pSsaa - 1.0f) < 1e-5f,
+                  "#253: active stock preset in Settings.xml reads OptionDefaults\\Ultra.fxcfg instead of leftover Custom .fxcfg");
+
+            // 2. Custom active: picks highest version Custom.4.4.fxcfg over newer-mtime Custom.4.3.fxcfg and ignores -backup.
+            const bool okCustom = edvr::resolveActivePresetMultipliers(
+                [](std::string* out) { *out = "<GraphicsOptions><PresetName>Custom</PresetName></GraphicsOptions>"; return true; },
+                readStock, readUser, [&]() { return userFiles; }, &pHmd, &pSsaa, &pSrc);
+            check(okCustom && pSrc == "Custom.4.4.fxcfg" && std::abs(pSsaa - 0.65f) < 1e-5f && std::abs(pHmd - 1.25f) < 1e-5f,
+                  "#253: active Custom preset picks highest-versioned Custom.4.4.fxcfg and ignores backups");
+
+            // 3. User-named preset (not in OptionDefaults): reads MyPreset.4.2.fxcfg from Options\Graphics.
+            const bool okUser = edvr::resolveActivePresetMultipliers(
+                [](std::string* out) { *out = "<GraphicsOptions><PresetName>MyPreset</PresetName></GraphicsOptions>"; return true; },
+                readStock, readUser, [&]() { return userFiles; }, &pHmd, &pSsaa, &pSrc);
+            check(okUser && pSrc == "MyPreset.4.2.fxcfg" && std::abs(pSsaa - 0.85f) < 1e-5f,
+                  "#253: user-named preset resolves its own versioned .fxcfg rather than Custom");
+
+            // 4. Named preset with no matching file (and unsafe path traversal): refuses to read leftover Custom.
+            const bool okMissing = edvr::resolveActivePresetMultipliers(
+                [](std::string* out) { *out = "<GraphicsOptions><PresetName>VRHigh</PresetName></GraphicsOptions>"; return true; },
+                readStock, readUser, [&]() { return userFiles; }, &pHmd, &pSsaa, &pSrc);
+            check(!okMissing && pSsaa == 0.0f && pSrc.empty(),
+                  "#253: missing active stock preset does not silently fall back to leftover Custom.4.4.fxcfg");
+            const bool okTraversal = edvr::resolveActivePresetMultipliers(
+                [](std::string* out) { *out = "<GraphicsOptions><PresetName>..\\Custom</PresetName></GraphicsOptions>"; return true; },
+                readStock, readUser, [&]() { return userFiles; }, &pHmd, &pSsaa, &pSrc);
+            check(!okTraversal && pSsaa == 0.0f && pSrc.empty(),
+                  "#253: unsafe PresetName with path traversal is rejected");
+
+            // 5. Missing Settings.xml: falls back to newest readable .fxcfg.
+            const std::vector<edvr::PresetFxcfgEntry> legacyFiles = {
+                {"Custom.4.3.fxcfg", 100},
+                {"Custom.4.4.fxcfg", 400},
+            };
+            const bool okLegacy = edvr::resolveActivePresetMultipliers(
+                [](std::string*) { return false; },
+                readStock, readUser, [&]() { return legacyFiles; }, &pHmd, &pSsaa, &pSrc);
+            check(okLegacy && pSrc == "Custom.4.4.fxcfg" && std::abs(pSsaa - 0.65f) < 1e-5f,
+                  "#253: absent Settings.xml falls back to newest .fxcfg in Options\\Graphics");
+
+            // 6. Custom active with only lookalike Custom*.fxcfg files (matching terrain_checkerboard_reader.h):
+            //    rejects Custom.beta.fxcfg, CustomOld.fxcfg, and backups, leaving auto bias unset.
+            const std::vector<edvr::PresetFxcfgEntry> lookalikeCustomFiles = {
+                {"Custom.beta.fxcfg", 100},
+                {"CustomOld.fxcfg", 300},
+                {"Custom.4.4.fxcfg-backup", 999},
+                {"MyPreset.4.2.fxcfg", 500},
+            };
+            auto readLookalikeCustom = [&](const std::string& name, std::string* out) -> bool {
+                if (name == "Custom.beta.fxcfg" || name == "CustomOld.fxcfg") {
+                    *out = "<GraphicsOptions><SSAAMultiplier>0.50</SSAAMultiplier><HMDRenderTargetMultiplier>0.75</HMDRenderTargetMultiplier></GraphicsOptions>";
+                    return true;
+                }
+                return readUser(name, out);
+            };
+            const bool okLookalikeCustom = edvr::resolveActivePresetMultipliers(
+                [](std::string* out) { *out = "<GraphicsOptions><PresetName>Custom</PresetName></GraphicsOptions>"; return true; },
+                readStock, readLookalikeCustom, [&]() { return lookalikeCustomFiles; }, &pHmd, &pSsaa, &pSrc);
+            check(!okLookalikeCustom && pSsaa == 0.0f && pHmd == 0.0f && pSrc.empty(),
+                  "#253: Custom preset rejects lookalike Custom*.fxcfg files (CustomOld/Custom.beta/backups) and leaves auto bias unset");
+        }
+    }
 
     if (g_fails) {
         printf("CONFIG TEST FAILED (%d)\n", g_fails);
