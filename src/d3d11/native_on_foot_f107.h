@@ -15,8 +15,12 @@
 // the commander (below).
 #pragma once
 
+#include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <type_traits>
 
 namespace edvr {
 namespace nofoot {
@@ -58,6 +62,39 @@ constexpr uint64_t kAwayStaleMs = 5000;   // the frame thread's: an open episode
 // The frame thread's reading of the hook's published episode: away while the hook says so and its newest call is within kAwayStaleMs.
 inline bool awayNow(bool published, uint64_t lastMs, uint64_t nowMs) noexcept { return published && nowMs >= lastMs && nowMs - lastMs <= kAwayStaleMs; }
 
+// True only when an open published episode has genuinely gone silent past kAwayStaleMs.
+// Distinguishes a real hook silence timeout from a clean close (published == false, whose
+// kEnded snapshot is already queued in EventQueue) and from minor cross-thread clock skew
+// where the Animate thread stamped lastMs slightly ahead of the frame thread's nowMs.
+inline bool awayStale(bool published, uint64_t lastMs, uint64_t nowMs) noexcept {
+    return published && lastMs != 0 && nowMs > lastMs && nowMs - lastMs > kAwayStaleMs;
+}
+
+// Immutable snapshots captured at each episode edge so a quick end + restart
+// within one frame preserves episode N's exact ended counters and duration (#175).
+struct EpisodeStart {
+    uint32_t episode = 0;
+    uint32_t rejoins = 0;
+    double distanceM = 0.0;
+    double holdS = kReturnHoldS;
+    bool byShop = false;
+    bool byDistance = false;
+};
+
+struct EpisodeEnd {
+    uint32_t episode = 0;
+    uint32_t calls = 0;
+    uint32_t notNumber = 0;
+    uint32_t alternations = 0;
+    uint32_t rejoins = 0;
+    uint32_t shopCalls = 0;
+    uint32_t distanceCalls = 0;
+    double durationS = 0.0;
+    double holdS = kReturnHoldS;
+    double nearestM = 0.0;
+    double farthestM = 0.0;
+};
+
 // One episode of the camera away, for the edge lines: the calls the pin refused (every call from the first far one until the return), the far calls and the nearest and farthest distance of them
 // (m; a camera that is not a number counts apart), the time and how often the camera came back near and left again before the hold ran out.
 struct Away {
@@ -67,12 +104,33 @@ struct Away {
     bool beganByShop = false, beganByDistance = false;   // F209: what made the episode's first call away
     double startS = 0.0, lastS = 0.0, nearestM = 0.0, farthestM = 0.0, nearSinceS = -1.0, lastCallS = -1.0;
     double holdS = kReturnHoldS, endS = -1.0;   // the hold now in force (doubled by a rejoin) and when the last episode ended by it
+    bool hasClosed = false;
+    EpisodeEnd lastClosed{};
+    bool hasStarted = false;
+    EpisodeStart lastStarted{};
     enum Edge : uint8_t { kNone = 0, kLeft = 1, kBack = 2 };
     // One pinned call: its eye - neck distance and its time (s, monotonic). Returns the edge this call made. While an episode is open every call is refused (the pin takes nothing from a camera
     // that was away a moment ago), near ones too; the episode ends on the first near call after the camera has been near for holdS without a far one between.
     Edge step(double eyeNeckM, double tS, bool shopOpen = false) noexcept {
+        hasClosed = false;
+        hasStarted = false;
         Edge e = kNone;
+        auto snapshotEnd = [&](double endTimeS) noexcept {
+            lastClosed.episode = episodes;
+            lastClosed.calls = calls;
+            lastClosed.notNumber = notNumber;
+            lastClosed.alternations = alternations;
+            lastClosed.rejoins = rejoins;
+            lastClosed.shopCalls = shopCalls;
+            lastClosed.distanceCalls = distanceCalls;
+            lastClosed.durationS = endTimeS >= startS ? (endTimeS - startS) : 0.0;
+            lastClosed.holdS = holdS;
+            lastClosed.nearestM = nearestM;
+            lastClosed.farthestM = farthestM;
+            hasClosed = true;
+        };
         if (away && lastCallS >= 0.0 && tS - lastCallS > kSilenceS) {   // no call for kSilenceS: nothing was pinned, the episode is over
+            snapshotEnd(lastS);
             away = false;
             nearSinceS = -1.0;
             endS = -1.0;
@@ -81,6 +139,7 @@ struct Away {
         lastCallS = tS;
         const bool byDistance = !onCommander(eyeNeckM);
         const bool farNow = shopOpen || byDistance;   // F209: a buy screen open holds the camera away at any distance
+        bool startedThisCall = false;
         if (farNow) {
             if (!away) {
                 const bool rejoin = endS >= 0.0 && tS - endS <= kRejoinS;   // the camera went far again right after an end: the same trouble, the hold doubles
@@ -94,6 +153,7 @@ struct Away {
                 startS = tS;
                 nearestM = farthestM = 0.0;
                 nearSinceS = -1.0;
+                startedThisCall = true;
                 e = kLeft;
             } else if (nearSinceS >= 0.0) {   // back near for a while, and gone again before the hold: the same episode
                 ++alternations;
@@ -102,6 +162,7 @@ struct Away {
         } else if (away) {
             if (nearSinceS < 0.0) nearSinceS = tS;
             if (tS - nearSinceS >= holdS) {
+                snapshotEnd(tS);
                 away = false;
                 nearSinceS = -1.0;
                 endS = tS;
@@ -122,8 +183,185 @@ struct Away {
                     ++notNumber;
                 }
             }
+            if (startedThisCall) {
+                lastStarted.episode = episodes;
+                lastStarted.rejoins = rejoins;
+                lastStarted.distanceM = farthestM;
+                lastStarted.holdS = holdS;
+                lastStarted.byShop = beganByShop;
+                lastStarted.byDistance = beganByDistance;
+                hasStarted = true;
+            }
         }
         return e;
+    }
+};
+
+// Lock-free SPSC edge queue from the Animate post-hook (producer) to the frame
+// thread's f107Tick (consumer) so sub-frame end+restart transitions keep their
+// ended lines and frozen counters (#175).
+struct Event {
+    enum Kind : uint8_t { kLeft = 0, kEnded = 1 };
+    Kind kind = kLeft;
+    EpisodeStart start{};
+    EpisodeEnd end{};
+};
+
+class EventQueue {
+  public:
+    static constexpr uint32_t kCapacity = 16;
+
+    bool pushLeft(const EpisodeStart& s) noexcept {
+        Event ev;
+        ev.kind = Event::kLeft;
+        ev.start = s;
+        return push(ev);
+    }
+    bool pushEnded(const EpisodeEnd& e) noexcept {
+        Event ev;
+        ev.kind = Event::kEnded;
+        ev.end = e;
+        return push(ev);
+    }
+    bool pop(Event* out) noexcept {
+        const uint32_t tail = tail_.load(std::memory_order_relaxed);
+        const uint32_t head = head_.load(std::memory_order_acquire);
+        if (tail == head) return false;
+        if (out) *out = ring_[tail % kCapacity];
+        tail_.store(tail + 1, std::memory_order_release);
+        return true;
+    }
+    uint32_t dropped() const noexcept { return dropped_.load(std::memory_order_relaxed); }
+
+  private:
+    bool push(const Event& ev) noexcept {
+        const uint32_t head = head_.load(std::memory_order_relaxed);
+        const uint32_t tail = tail_.load(std::memory_order_acquire);
+        if (head - tail >= kCapacity) {
+            dropped_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        ring_[head % kCapacity] = ev;
+        head_.store(head + 1, std::memory_order_release);
+        return true;
+    }
+
+    Event ring_[kCapacity]{};
+    std::atomic<uint32_t> head_{0};
+    std::atomic<uint32_t> tail_{0};
+    std::atomic<uint32_t> dropped_{0};
+};
+
+// Wait-free functional camera-away state shared between the Animate post-hook
+// (single writer) and f107Tick on the frame thread (single reader). Packed into
+// one 64-bit atomic word ((lastMs << 1) | away) so the functional away decision
+// is C++17 data-race-free and never drops to false under diagnostic snapshot
+// contention (#175).
+struct AwayState {
+    bool away = false;
+    uint64_t lastMs = 0;
+};
+
+class AwayStateBox {
+  public:
+    void publish(bool away, uint64_t lastMs) noexcept {
+        constexpr uint64_t kMsMask = (uint64_t{1} << 63) - 1ull;
+        const uint64_t packed = ((lastMs & kMsMask) << 1) | (away ? 1ull : 0ull);
+        packed_.store(packed, std::memory_order_release);
+    }
+
+    AwayState load() const noexcept {
+        const uint64_t packed = packed_.load(std::memory_order_acquire);
+        return AwayState{(packed & 1ull) != 0, packed >> 1};
+    }
+
+  private:
+    std::atomic<uint64_t> packed_{0};
+};
+
+// Coherent, C++17 data-race-free live episode snapshot published by the Animate
+// post-hook under an atomic-word seqlock so f107Tick never pairs episode N's
+// stale timeout with episode N+1's counters or performs non-atomic concurrent
+// accesses (#175).
+class SnapshotBox {
+  public:
+    static_assert(std::is_trivially_copyable<EpisodeEnd>::value, "EpisodeEnd must be trivially copyable");
+    static constexpr size_t kWords = (sizeof(EpisodeEnd) + sizeof(uint64_t) - 1u) / sizeof(uint64_t);
+
+    void publish(const EpisodeEnd& s) noexcept {
+        uint64_t tmp[kWords]{};
+        std::memcpy(tmp, &s, sizeof(s));
+        const uint32_t seq = seq_.load(std::memory_order_relaxed);
+        seq_.store(seq + 1u, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        for (size_t i = 0; i < kWords; ++i) {
+            words_[i].store(tmp[i], std::memory_order_relaxed);
+        }
+        seq_.store(seq + 2u, std::memory_order_release);
+    }
+
+    bool read(EpisodeEnd* out) const noexcept {
+        if (!out) return false;
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            const uint32_t s1 = seq_.load(std::memory_order_acquire);
+            if (s1 & 1u) continue;
+            uint64_t tmp[kWords]{};
+            for (size_t i = 0; i < kWords; ++i) {
+                tmp[i] = words_[i].load(std::memory_order_relaxed);
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const uint32_t s2 = seq_.load(std::memory_order_relaxed);
+            if (s1 == s2) {
+                std::memcpy(out, tmp, sizeof(*out));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Test hook: allows unit tests to verify read() behavior while a write is in progress.
+    uint32_t seqForTest() const noexcept { return seq_.load(std::memory_order_relaxed); }
+    void setSeqForTest(uint32_t s) noexcept { seq_.store(s, std::memory_order_relaxed); }
+
+  private:
+    std::atomic<uint32_t> seq_{0};
+    std::atomic<uint64_t> words_[kWords]{};
+};
+
+// Frame-thread logger state: drains queued hook edges in FIFO order, suppresses
+// a duplicate ended line if stale-timeout already closed that episode, and
+// still closes an open episode on stale-timeout when hook calls stop.
+struct LogState {
+    bool logged = false;
+    uint32_t openEpisode = 0;
+    uint64_t leftMs = 0;
+
+    template <typename OnLeftFn, typename OnEndedFn>
+    void drainEvents(EventQueue& queue, uint64_t nowMs, OnLeftFn&& onLeft, OnEndedFn&& onEnded) noexcept {
+        Event ev;
+        while (queue.pop(&ev)) {
+            if (ev.kind == Event::kLeft) {
+                logged = true;
+                openEpisode = ev.start.episode;
+                leftMs = nowMs;
+                onLeft(ev.start);
+            } else if (ev.kind == Event::kEnded) {
+                if (logged && openEpisode == ev.end.episode) {
+                    logged = false;
+                    onEnded(ev.end);
+                }
+            }
+        }
+    }
+
+    template <typename OnEndedFn>
+    void checkStale(uint64_t nowMs, bool timedOut, const EpisodeEnd& staleFallback, OnEndedFn&& onEnded) noexcept {
+        if (timedOut && logged && staleFallback.episode == openEpisode) {
+            logged = false;
+            EpisodeEnd end = staleFallback;
+            end.durationS = nowMs >= leftMs ? static_cast<double>(nowMs - leftMs) * 1e-3 : 0.0;
+            onEnded(end);
+        }
     }
 };
 

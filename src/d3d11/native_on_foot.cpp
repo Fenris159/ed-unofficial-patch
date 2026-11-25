@@ -15065,59 +15065,82 @@ nofoot::f94::NeckRaise g_f94Raise;
 nofoot::f88::Settle g_f94Settle;
 // F107: the game's camera away from the commander, published by the Animate post-hook (the pin refused the call): the episode, its calls and its distances.
 // The frame thread logs the edges (the hook does not log) and takes the neck reference's raise out while the camera is away.
-std::atomic<bool> g_f107AwayNow{false};
-std::atomic<uint32_t> g_f107Episodes{0}, g_f107Calls{0}, g_f107NotNumber{0}, g_f107Alternations{0}, g_f107Rejoins{0};   // F208: the calls refused (near ones of an open episode too), the returns that did not last the hold, the episodes that began again within kRejoinS of an end
-std::atomic<float> g_f107HoldS{nofoot::f107::kReturnHoldS};   // F208b: the hold in force for the open episode (doubled by rejoins)
-std::atomic<float> g_f107NearestM{0.0f}, g_f107FarthestM{0.0f};
-std::atomic<uint64_t> g_f107LastMs{0};
-std::atomic<uint32_t> g_f107ShopCalls{0}, g_f107DistanceCalls{0};   // F209: this episode's calls refused with a buy screen open / with the camera over kOnCommanderM (one call can be both)
-std::atomic<uint8_t> g_f107Began{0};   // F209: what made the episode's first call away: bit 0 the shop screen, bit 1 the distance test
-uint32_t g_f107EpisodesLogged = 0;
-bool g_f107AwayLogged = false;
-uint64_t g_f107LeftMs = 0;
+nofoot::f107::AwayStateBox g_f107AwayState;   // #175: wait-free functional away flag + timestamp from pinStage0 -> f107Tick
+nofoot::f107::SnapshotBox g_f107Snapshot;     // #175: atomic-word seqlock diagnostic snapshot from pinStage0 -> f107Tick
+std::atomic<uint8_t> g_f107Began{0};        // F209: what made the episode's first call away: bit 0 the shop screen, bit 1 the distance test
+nofoot::f107::EventQueue g_f107Events;      // #175: immutable edge snapshots from pinStage0 -> f107Tick
+nofoot::f107::LogState g_f107LogState;
 shop::Pacer g_shopSecondPacer;   // F209: the once-a-second line (frame thread)
 // F209: while a buy screen is open, the kiosk session runs or the UI state machine is in a vendor state: one line a second with the game's flag bytes and F107's state (the frame thread's;
 // the hooks' own event lines are written by native_on_foot_hooks.cpp's frame boundary). Silent when none of them is set, or when the shop hooks are not armed.
-void shopSecondLine(uint64_t now, bool away, uint32_t episodes) noexcept {
+void shopSecondLine(uint64_t now, bool away, uint32_t episodes, uint32_t calls, uint32_t shopCalls) noexcept {
     NativeOnFootShopRead r;
     if (!nativeOnFootShopRead(&r) || !shop::anySet(r.buyScreenOpen, r.kiosk, r.state, r.liveryOpen) || !g_shopSecondPacer.due(now)) return;
     char f107[200];
     std::snprintf(f107, sizeof(f107), "%s (episode %u, %u calls refused, %u with a buy screen open)", away ? "away" : "not away", episodes,
-                  g_f107Calls.load(std::memory_order_relaxed), g_f107ShopCalls.load(std::memory_order_relaxed));
+                  calls, shopCalls);
     char line[512];
     shop::formatSecond(line, sizeof(line), r.suitByte, r.weaponsByte, r.kioskByte, r.liveryByte, r.weaponLiveryByte, r.state, r.signal, f107);
     Log::get().note("%s", line);
 }
 bool f107Tick(uint64_t now) noexcept {
-    const uint64_t last = g_f107LastMs.load(std::memory_order_relaxed);
-    // F208: an open episode is over only when the hook says so (the camera stayed on the commander for the hold) or has not reported for kAwayStaleMs; the hook reports on every call of an open
-    // episode, so a camera that alternates between far and near never ages, and a short stale report alone (the old 250 ms) ends nothing
-    const bool away = nofoot::f107::awayNow(g_f107AwayNow.load(std::memory_order_acquire), last, now);
-    const uint32_t episodes = g_f107Episodes.load(std::memory_order_relaxed);
-    if (away && (!g_f107AwayLogged || episodes != g_f107EpisodesLogged)) {
-        g_f107AwayLogged = true;
-        g_f107EpisodesLogged = episodes;
-        g_f107LeftMs = now;
+    auto logLeft = [](const nofoot::f107::EpisodeStart& s) noexcept {
         // F208b / F209: the test that made the camera away is named: the Pioneer Supplies buy screen's own open flag ("the shop screen", at any distance), the distance from the neck, or both
-        const uint8_t began = g_f107Began.load(std::memory_order_relaxed);
-        const bool byShop = (began & 1u) != 0, byDistance = (began & 2u) != 0 || !byShop;
+        const bool byShop = s.byShop;
+        const bool byDistance = s.byDistance || !byShop;
         Log::get().note("native on foot camera away (F107): the game's camera left the commander (episode %u): %.1f m from the neck, %s the %.1f m a commander's "
                         "eye can be%s (away by: the %s); the body pin, the neck reference and the standing calibration take nothing from it, and the neck reference's raise ramps out "
                         "(the view is the game's own camera); the episode ends after the camera has stayed on the commander for %.1f s%s",
-                        episodes, static_cast<double>(g_f107FarthestM.load(std::memory_order_relaxed)), byDistance ? "over" : "within", nofoot::f107::kOnCommanderM,
+                        s.episode, s.distanceM, byDistance ? "over" : "within", nofoot::f107::kOnCommanderM,
                         byShop ? (byDistance ? ", and a buy screen is open" : ", but a buy screen is open") : "",
-                        byShop ? (byDistance ? "shop screen and the distance test" : "shop screen") : "distance test", static_cast<double>(g_f107HoldS.load(std::memory_order_relaxed)),
-                        g_f107Rejoins.load(std::memory_order_relaxed) ? " (doubled: it began again within 3 s of an end)" : "");
-    } else if (!away && g_f107AwayLogged) {
-        g_f107AwayLogged = false;
+                        byShop ? (byDistance ? "shop screen and the distance test" : "shop screen") : "distance test", s.holdS,
+                        s.rejoins ? " (doubled: it began again within 3 s of an end)" : "");
+    };
+    auto logEnded = [](const nofoot::f107::EpisodeEnd& e) noexcept {
         Log::get().note("native on foot camera away (F107): the episode ended after %.1f s (episode %u): %u pinned calls refused, the camera "
                         "%.1f to %.1f m from the neck, not a number in %u, back near and gone again within the %.1f s hold %u times (rejoins in a row %u); the neck reference takes its target from the next settled stance (calls held by the shop screen %u, by the distance test %u)",
-                        static_cast<double>(now - g_f107LeftMs) * 1e-3, episodes, g_f107Calls.load(std::memory_order_relaxed),
-                        static_cast<double>(g_f107NearestM.load(std::memory_order_relaxed)), static_cast<double>(g_f107FarthestM.load(std::memory_order_relaxed)),
-                        g_f107NotNumber.load(std::memory_order_relaxed), static_cast<double>(g_f107HoldS.load(std::memory_order_relaxed)), g_f107Alternations.load(std::memory_order_relaxed),
-                        g_f107Rejoins.load(std::memory_order_relaxed), g_f107ShopCalls.load(std::memory_order_relaxed), g_f107DistanceCalls.load(std::memory_order_relaxed));
+                        e.durationS, e.episode, e.calls, e.nearestM, e.farthestM, e.notNumber, e.holdS, e.alternations,
+                        e.rejoins, e.shopCalls, e.distanceCalls);
+    };
+    // Drain queued hook edges first so any popped kLeft synchronizes with the hook's
+    // prior publication of g_f107Snapshot before we sample away/stale state.
+    g_f107LogState.drainEvents(g_f107Events, now, logLeft, logEnded);
+    static uint32_t lastDropped = 0;
+    const uint32_t dropped = g_f107Events.dropped();
+    if (dropped != lastDropped) {
+        Log::get().note("native on foot camera away (F107): event queue overflow dropped %u edge(s) (%u total)",
+                        dropped - lastDropped, dropped);
+        lastDropped = dropped;
     }
-    shopSecondLine(now, away, episodes);   // F209
+    // Read the diagnostic snapshot BEFORE loading AwayState (the hook publishes AwayState
+    // before Snapshot), so any resumed same-episode snapshot is paired with the fresh timestamp.
+    static nofoot::f107::EpisodeEnd lastSnap{};
+    nofoot::f107::EpisodeEnd snap{};
+    const bool snapOk = g_f107Snapshot.read(&snap);
+    if (snapOk) lastSnap = snap;
+    // Read the wait-free functional away state independently of the diagnostic snapshot so
+    // snapshot contention can never drop `away` to false during an away-camera view (#175).
+    // Use a monotonic clock read at least as fresh as the acquire so cross-thread tick skew
+    // never makes a new episode look stale.
+    nofoot::f107::AwayState awayState = g_f107AwayState.load();
+    uint64_t tickNow = std::max(now, static_cast<uint64_t>(GetTickCount64()));
+    // F208: an open episode is over only when the hook says so (the camera stayed on the commander for the hold) or has not reported for kAwayStaleMs; the hook reports on every call of an open
+    // episode, so a camera that alternates between far and near never ages, and a short stale report alone (the old 250 ms) ends nothing
+    bool away = nofoot::f107::awayNow(awayState.away, awayState.lastMs, tickNow);
+    const bool timedOut = nofoot::f107::awayStale(awayState.away, awayState.lastMs, tickNow);
+    if (timedOut) {
+        // Re-drain queued edges and re-load AwayState AFTER the snapshot read and drain before
+        // committing a stale close: an exact kEnded wins, and a hook that resumed the same away
+        // episode (emitting no edge) clears the stale timeout instead of falsely closing the episode.
+        g_f107LogState.drainEvents(g_f107Events, tickNow, logLeft, logEnded);
+        awayState = g_f107AwayState.load();
+        tickNow = std::max(tickNow, static_cast<uint64_t>(GetTickCount64()));
+        away = nofoot::f107::awayNow(awayState.away, awayState.lastMs, tickNow);
+        const bool stillTimedOut = nofoot::f107::awayStale(awayState.away, awayState.lastMs, tickNow);
+        if (stillTimedOut && snapOk) g_f107LogState.checkStale(tickNow, true, snap, logEnded);
+    }
+    const nofoot::f107::EpisodeEnd& diagSnap = snapOk ? snap : lastSnap;
+    shopSecondLine(now, away, diagSnap.episode, diagSnap.calls, diagSnap.shopCalls);   // F209
     return away;
 }
 struct F94Tick {
@@ -18021,22 +18044,29 @@ bool pinStage0(const pfz::ArmPlan& pl, const PfzSpan& sp, bool froze, uint64_t n
             // take nothing from this call (native_on_foot_f107.h); the edges and the episode go to the frame thread, which logs them
             const double eyeNeckM = nofoot::f107::eyeNeckDistance(E, N0);
             g_f107Away.step(eyeNeckM, static_cast<double>(f30QpcUs(in.qpc)) * 1e-6, nativeOnFootShopOpen());   // F209: a Pioneer Supplies buy screen open holds the camera away at any distance; F228, F234: so does a Livery screen or the loadout browser
+            // Push kEnded BEFORE publishing the updated state so f107Tick sees the exact end snapshot before stale-timeout.
+            if (g_f107Away.hasClosed) g_f107Events.pushEnded(g_f107Away.lastClosed);
+            nofoot::f107::EpisodeEnd curSnap{};
+            curSnap.episode = g_f107Away.episodes;
+            curSnap.calls = g_f107Away.calls;
+            curSnap.notNumber = g_f107Away.notNumber;
+            curSnap.alternations = g_f107Away.alternations;
+            curSnap.rejoins = g_f107Away.rejoins;
+            curSnap.shopCalls = g_f107Away.shopCalls;
+            curSnap.distanceCalls = g_f107Away.distanceCalls;
+            curSnap.holdS = g_f107Away.holdS;
+            curSnap.nearestM = g_f107Away.nearestM;
+            curSnap.farthestM = g_f107Away.farthestM;
             if (g_f107Away.away) {
                 refusal = kPinRefCameraAway;
-                g_f107ShopCalls.store(g_f107Away.shopCalls, std::memory_order_relaxed);
-                g_f107DistanceCalls.store(g_f107Away.distanceCalls, std::memory_order_relaxed);
                 g_f107Began.store(static_cast<uint8_t>((g_f107Away.beganByShop ? 1u : 0u) | (g_f107Away.beganByDistance ? 2u : 0u)), std::memory_order_relaxed);
-                g_f107Calls.store(g_f107Away.calls, std::memory_order_relaxed);
-                g_f107Alternations.store(g_f107Away.alternations, std::memory_order_relaxed);
-                g_f107Rejoins.store(g_f107Away.rejoins, std::memory_order_relaxed);
-                g_f107HoldS.store(static_cast<float>(g_f107Away.holdS), std::memory_order_relaxed);
-                g_f107NotNumber.store(g_f107Away.notNumber, std::memory_order_relaxed);
-                g_f107NearestM.store(static_cast<float>(g_f107Away.nearestM), std::memory_order_relaxed);
-                g_f107FarthestM.store(static_cast<float>(g_f107Away.farthestM), std::memory_order_relaxed);
-                g_f107LastMs.store(now, std::memory_order_relaxed);
             }
-            g_f107Episodes.store(g_f107Away.episodes, std::memory_order_relaxed);
-            g_f107AwayNow.store(g_f107Away.away, std::memory_order_release);
+            // Publish AwayState BEFORE Snapshot so f107Tick (which reads Snapshot then loads AwayState)
+            // never combines a resumed same-episode snapshot with an old stale timestamp (#175).
+            g_f107AwayState.publish(g_f107Away.away, g_f107Away.away ? now : 0);
+            g_f107Snapshot.publish(curSnap);
+            // Push kLeft AFTER publishing AwayState/Snapshot so f107Tick's post-drain `away` check sees away=true.
+            if (g_f107Away.hasStarted) g_f107Events.pushLeft(g_f107Away.lastStarted);
         }
         pc.f86LocalOk = localPitchValid;   // F86g
         pc.f86LocalY = static_cast<double>(in.localHeadY);

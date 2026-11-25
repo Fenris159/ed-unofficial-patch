@@ -9,7 +9,10 @@
 #include "../../src/d3d11/native_on_foot_f107.h"
 
 #include <cmath>
+#include <fstream>
 #include <limits>
+#include <sstream>
+#include <string>
 
 namespace f107test {
 
@@ -257,6 +260,219 @@ inline void run107(Check&& check) {
         const double hScreen = 1.543 + 174.25, hStand = 1.58, eyeNow = 1.58;
         check(edvr::nofoot::pinCrouchWeight(true, hScreen, eyeNow) >= 1.0 && edvr::nofoot::pinCrouchWeight(true, hStand, eyeNow) == 0.0,
               "F107 (control): a standing calibration taken on the screen's camera makes every standing call crouched (w_c 1); the commander's own leaves it 0");
+    }
+    {   // Issue #175: an episode that ends and restarts within one frame must not lose its ended line or corrupt episode 1's counters.
+        f107::Away a;
+        f107::EventQueue q;
+        f107::LogState log;
+        struct Record {
+            bool isLeft = false;
+            uint32_t ep = 0, calls = 0, alternations = 0, rejoins = 0, shopCalls = 0, distCalls = 0;
+            double durationS = 0.0, holdS = 0.0, maxM = 0.0;
+        };
+        std::vector<Record> records;
+        auto stepPush = [&](double d, double tS, bool shop) {
+            a.step(d, tS, shop);
+            if (a.hasClosed) q.pushEnded(a.lastClosed);
+            if (a.hasStarted) q.pushLeft(a.lastStarted);
+        };
+        auto tick = [&](uint64_t nowMs, bool timedOut = false) {
+            f107::EpisodeEnd fallback;
+            auto onLeft = [&](const f107::EpisodeStart& s) {
+                records.push_back({true, s.episode, 0, 0, s.rejoins, 0, 0, 0.0, s.holdS, s.distanceM});
+            };
+            auto onEnded = [&](const f107::EpisodeEnd& e) {
+                records.push_back({false, e.episode, e.calls, e.alternations, e.rejoins, e.shopCalls, e.distanceCalls,
+                                   e.durationS, e.holdS, e.farthestM});
+            };
+            log.drainEvents(q, nowMs, onLeft, onEnded);
+            if (timedOut) log.checkStale(nowMs, true, fallback, onEnded);
+        };
+
+        // Episode 1: away by distance + shop, one alternation, frame thread logs left(1).
+        stepPush(3.7, 1.000, true);
+        stepPush(0.46, 1.100, false);
+        stepPush(4.2, 1.200, false);
+        tick(1200);
+        // Stay close for >= 2.0 s hold -> closes episode 1 at t=3.301 (avoiding 3.3 - 1.3 < 2.0 in IEEE-754), then rejoins 12 ms later at t=3.313 BEFORE the next frame tick.
+        stepPush(0.46, 1.300, false);
+        stepPush(0.46, 3.301, false);
+        stepPush(3.8, 3.313, false);
+        tick(3315);
+
+        const bool subFrameOk =
+            records.size() == 3 &&
+            records[0].isLeft && records[0].ep == 1 &&
+            !records[1].isLeft && records[1].ep == 1 && records[1].calls == 4 && records[1].alternations == 1 &&
+            records[1].shopCalls == 1 && records[1].distCalls == 2 && std::fabs(records[1].durationS - 2.301) < 1e-6 &&
+            std::fabs(records[1].maxM - 4.2) < 1e-6 &&
+            records[2].isLeft && records[2].ep == 2 && records[2].rejoins == 1 && records[2].holdS == 4.0;
+        check(subFrameOk,
+              "F107 (#175): end + 12 ms rejoin within one frame emits ended(1) with episode 1's exact counters before left(2)");
+
+        // Control: old polling-only logic (watching awayNow/episodes without the queue) sees away=true on both ticks and drops ended(1) permanently.
+        {
+            const bool oldWasAway = true;
+            const bool oldNowAway = a.away;
+            const bool oldEmitsEnded = oldWasAway && !oldNowAway;
+            check(!oldEmitsEnded && a.episodes == 2,
+                  "F107 (#175 control): polling awayNow alone misses ended(1) when episode 2 starts before the next tick");
+        }
+
+        // Same-call silence (>5 s) + immediate far restart:
+        // Subcase A (frame thread stalled, no stale timeout emitted yet): emits ended(2) then left(3).
+        records.clear();
+        stepPush(5.1, 10.000, false);
+        tick(10000);
+        check(records.size() == 2 && !records[0].isLeft && records[0].ep == 2 && records[0].calls == 1 &&
+                  records[1].isLeft && records[1].ep == 3 && records[1].holdS == 2.0,
+              "F107 (#175): same-call silence close + immediate restart emits ended(2) then left(3) when frame thread was stalled");
+
+        // Subcase B (frame thread ticked after stale timeout, closing ep 3 first): later silence+far must NOT double-emit ended(3).
+        records.clear();
+        f107::EpisodeEnd staleFb;
+        staleFb.episode = 3;
+        staleFb.calls = 1;
+        staleFb.farthestM = 5.1;
+        log.drainEvents(
+            q, 16000,
+            [&](const f107::EpisodeStart& s) {
+                records.push_back({true, s.episode, 0, 0, s.rejoins, 0, 0, 0.0, s.holdS, s.distanceM});
+            },
+            [&](const f107::EpisodeEnd& e) {
+                records.push_back({false, e.episode, e.calls, e.alternations, e.rejoins, e.shopCalls, e.distanceCalls,
+                                   e.durationS, e.holdS, e.farthestM});
+            });
+        log.checkStale(
+            16000, f107::awayStale(true, 10000, 16000), staleFb,
+            [&](const f107::EpisodeEnd& e) {
+                records.push_back({false, e.episode, e.calls, e.alternations, e.rejoins, e.shopCalls, e.distanceCalls,
+                                   e.durationS, e.holdS, e.farthestM});
+            });
+        stepPush(6.0, 17.000, false);
+        tick(17000);
+        check(records.size() == 2 && !records[0].isLeft && records[0].ep == 3 &&
+                  records[1].isLeft && records[1].ep == 4,
+              "F107 (#175): stale-timeout close followed by silence+restart suppresses duplicate ended(3) and logs left(4)");
+
+        // Subcase C (hook resumes right as stale-timeout fires, plus wait-free AwayStateBox & atomic SnapshotBox):
+        // a mismatched episode N+1 snapshot must NEVER be relabeled as episode N, re-draining right before checkStale
+        // lets episode N's exact kEnded win, and diagnostic snapshot contention must NEVER drop functional `away` to false.
+        {
+            f107::AwayStateBox awayBox;
+            const uint64_t bigMs = (uint64_t{1} << 40) + 17000ull;
+            awayBox.publish(true, bigMs);
+            const f107::AwayState stOn = awayBox.load();
+            awayBox.publish(false, 0);
+            const f107::AwayState stOff = awayBox.load();
+            check(stOn.away && stOn.lastMs == bigMs && !stOff.away && stOff.lastMs == 0,
+                  "F107 (#175): AwayStateBox packs and loads away flag + 63-bit timestamp wait-free");
+
+            f107::SnapshotBox box;
+            f107::EpisodeEnd ep4Snap{};
+            ep4Snap.episode = 4;
+            ep4Snap.calls = 1;
+            ep4Snap.farthestM = 6.0;
+            box.publish(ep4Snap);
+            awayBox.publish(true, 17000);
+            f107::EpisodeEnd got{};
+            check(box.read(&got) && got.episode == 4 && got.calls == 1 && std::fabs(got.farthestM - 6.0) < 1e-6,
+                  "F107 (#175): atomic-word SnapshotBox publishes and reads a coherent episode-tagged snapshot");
+
+            // Simulate writer paused mid-update (odd sequence): SnapshotBox::read returns false,
+            // while AwayStateBox independently keeps functional away=true (neck offsets stay off).
+            const uint32_t evenSeq = box.seqForTest();
+            box.setSeqForTest(evenSeq | 1u);
+            f107::EpisodeEnd contended{};
+            const bool readWhileOdd = box.read(&contended);
+            const f107::AwayState stWhileContended = awayBox.load();
+            box.setSeqForTest(evenSeq);
+            check(!readWhileOdd && f107::awayNow(stWhileContended.away, stWhileContended.lastMs, 17500),
+                  "F107 (#175): contended SnapshotBox returns false without dropping wait-free functional away to false");
+
+            // Simulate episode 4 open, silence > 5 s, hook wakes and queues exact ended(4) + left(5) and publishes ep 5.
+            records.clear();
+            stepPush(7.5, 24.000, false);   // closes ep 4 (1 call, 6.0 m) and starts ep 5 (1 call, 7.5 m)
+            f107::EpisodeEnd ep5WrongFb{};
+            ep5WrongFb.episode = 5;
+            ep5WrongFb.calls = 99;
+            ep5WrongFb.farthestM = 7.5;
+            auto onLeftC = [&](const f107::EpisodeStart& s) {
+                records.push_back({true, s.episode, 0, 0, s.rejoins, 0, 0, 0.0, s.holdS, s.distanceM});
+            };
+            auto onEndedC = [&](const f107::EpisodeEnd& e) {
+                records.push_back({false, e.episode, e.calls, e.alternations, e.rejoins, e.shopCalls, e.distanceCalls,
+                                   e.durationS, e.holdS, e.farthestM});
+            };
+            // Even without re-drain, a fallback tagged episode 5 must NOT close openEpisode 4.
+            log.checkStale(24000, true, ep5WrongFb, onEndedC);
+            check(records.empty() && log.logged && log.openEpisode == 4,
+                  "F107 (#175): checkStale rejects a fallback snapshot tagged with episode N+1 instead of relabeling it as episode N");
+            // Re-draining right before checkStale (as f107Tick does) lets exact ended(4) win over ep4Snap.
+            log.drainEvents(q, 24000, onLeftC, onEndedC);
+            log.checkStale(24000, true, ep4Snap, onEndedC);
+            check(records.size() == 2 && !records[0].isLeft && records[0].ep == 4 && records[0].calls == 1 &&
+                      std::fabs(records[0].maxM - 6.0) < 1e-6 && records[1].isLeft && records[1].ep == 5 &&
+                      std::fabs(records[1].maxM - 7.5) < 1e-6,
+                  "F107 (#175): pre-stale re-drain lets queued exact ended(4) win before left(5) without stale-fallback contamination");
+
+            // Resumed same episode after >5 s gap: hook updates AwayState without pushing any edge;
+            // revalidating AwayState after reading Snapshot + re-draining clears timedOut so episode 5 stays open
+            // and the real kEnded is NOT dropped.
+            records.clear();
+            awayBox.publish(true, 24000);   // episode 5 initially appears stale at t=30000
+            const f107::AwayState staleRead = awayBox.load();
+            const bool initiallyTimedOut = f107::awayStale(staleRead.away, staleRead.lastMs, 30000);
+            // Hook resumes episode 5 (still away, no edge pushed) and refreshes AwayState before Snapshot.
+            awayBox.publish(true, 30000);
+            f107::EpisodeEnd ep5Fresh{};
+            ep5Fresh.episode = 5;
+            ep5Fresh.calls = 2;
+            box.publish(ep5Fresh);
+            log.drainEvents(q, 30000, onLeftC, onEndedC);
+            const f107::AwayState rechecked = awayBox.load();
+            const bool stillTimedOut = f107::awayStale(rechecked.away, rechecked.lastMs, 30000);
+            log.checkStale(30000, stillTimedOut, ep5Fresh, onEndedC);
+            check(initiallyTimedOut && !stillTimedOut && records.empty() && log.logged && log.openEpisode == 5,
+                  "F107 (#175): revalidating AwayState after snapshot+drain prevents false stale close when the same episode resumes");
+        }
+
+        // Race guards: awayStale must be FALSE on clean close (published=false) and on cross-thread tick skew (lastMs > nowMs),
+        // and TRUE only when published=true and nowMs - lastMs > kAwayStaleMs.
+        check(!f107::awayStale(false, 1000, 9000) && !f107::awayStale(true, 1001, 1000) &&
+                  !f107::awayStale(true, 1000, 6000) && f107::awayStale(true, 1000, 6001) &&
+                  !f107::awayStale(true, 0, 9000),
+              "F107 (#175): awayStale fires only on genuine silence timeout, never on clean close or cross-thread clock skew");
+
+        // Overflow: >kCapacity pushes without draining increments dropped() and keeps the first kCapacity events intact.
+        {
+            f107::EventQueue fullQ;
+            uint32_t pushed = 0;
+            for (uint32_t i = 1; i <= f107::EventQueue::kCapacity + 3; ++i) {
+                f107::EpisodeStart s;
+                s.episode = i;
+                if (fullQ.pushLeft(s)) ++pushed;
+            }
+            f107::Event first{};
+            const bool popped = fullQ.pop(&first);
+            check(pushed == f107::EventQueue::kCapacity && fullQ.dropped() == 3 && popped && first.start.episode == 1,
+                  "F107 (#175): EventQueue bounds capacity, counts overflow drops, and preserves FIFO order");
+        }
+
+        // Source pin (#175): hook publishes AwayState before Snapshot, and f107Tick reads Snapshot before
+        // AwayState and revalidates AwayState after re-draining before committing checkStale.
+        {
+            std::ifstream f("src/d3d11/native_on_foot.cpp", std::ios::binary);
+            std::stringstream ss;
+            ss << f.rdbuf();
+            const std::string cpp = ss.str();
+            const size_t pubAway = cpp.find("g_f107AwayState.publish(g_f107Away.away");
+            const size_t pubSnap = cpp.find("g_f107Snapshot.publish(curSnap);");
+            const size_t recheck = cpp.find("const bool stillTimedOut = nofoot::f107::awayStale(awayState.away, awayState.lastMs, tickNow);");
+            check(!cpp.empty() && pubAway != std::string::npos && pubSnap != std::string::npos && pubAway < pubSnap &&
+                      recheck != std::string::npos,
+                  "F107 (#175): hook publishes AwayState before Snapshot and f107Tick revalidates AwayState after snapshot+drain before checkStale");
+        }
     }
 }
 
