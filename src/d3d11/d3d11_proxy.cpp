@@ -62,7 +62,7 @@ const char* const kExportNames[] = {
 };
 constexpr size_t kExportCount = sizeof(kExportNames) / sizeof(kExportNames[0]);
 
-HMODULE g_realModule = nullptr;    // what exports currently forward to
+std::atomic<HMODULE> g_realModule{nullptr};    // what exports currently forward to
 // What LoadLibraryW of <System32>\d3d11.dll returned inside DllMain, as it came: usually Windows' own, and not
 // checked there (nothing can be under the loader lock). A hook on LoadLibraryExW can answer that load with another
 // module, so the context probe and slot reclaim do not read this; they read probeSystemModule(), which checks it by path.
@@ -83,12 +83,16 @@ typedef HRESULT(WINAPI* PFN_D3D11CreateDeviceAndSwapChain)(
     const DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**, ID3D11Device**, D3D_FEATURE_LEVEL*,
     ID3D11DeviceContext**);
 
-PFN_D3D11CreateDevice             g_realCreateDevice = nullptr;
-PFN_D3D11CreateDeviceAndSwapChain g_realCreateDeviceAndSwapChain = nullptr;
+std::atomic<PFN_D3D11CreateDevice>             g_realCreateDevice{nullptr};
+std::atomic<PFN_D3D11CreateDeviceAndSwapChain> g_realCreateDeviceAndSwapChain{nullptr};
 // Windows' own, kept separately: when a chained proxy calls back into us these
-// are the only way out of the loop.
-PFN_D3D11CreateDevice             g_systemCreateDevice = nullptr;
-PFN_D3D11CreateDeviceAndSwapChain g_systemCreateDeviceAndSwapChain = nullptr;
+// are the only way out of the loop. Re-resolved once outside DllMain from the
+// verified System32 d3d11.dll (see probeSystemModule).
+std::atomic<PFN_D3D11CreateDevice>             g_systemCreateDevice{nullptr};
+std::atomic<PFN_D3D11CreateDeviceAndSwapChain> g_systemCreateDeviceAndSwapChain{nullptr};
+std::atomic<HMODULE>                           g_systemFallbackModule{nullptr};
+SRWLOCK                                        g_systemModuleLock = SRWLOCK_INIT;
+bool                                           g_initOnceExportsDone = false;  // guarded by g_systemModuleLock
 
 edvr::IatPatch g_patchChainedLoadLibraryA;
 edvr::IatPatch g_patchChainedLoadLibraryW;
@@ -280,29 +284,42 @@ void loaderPhase() {
     // returned. Loading the system copy first is not wasted: it guarantees every
     // export has somewhere to go for the window between DllMain and the first
     // export call, which is the window a deferred-only design would leave empty.
-    g_realModule = edvr::loadRealModule(*g_moduleDir, "", L"d3d11.dll", L"d3d11.dll");
-    g_systemModule = g_realModule;   // kept so chaining can fall back to it
-    if (!g_realModule) {
+    HMODULE loaded = edvr::loadRealModule(*g_moduleDir, "", L"d3d11.dll", L"d3d11.dll");
+    g_realModule.store(loaded, std::memory_order_release);
+    g_systemModule = loaded;   // kept so chaining can fall back to it
+    if (!loaded) {
         edvr::breadcrumb("gfx: FAILED to load real d3d11.dll");
         return;
     }
     edvr::breadcrumb("gfx: real d3d11 loaded");
 
     g_missingExports = edvr::resolveProcs(
-        g_realModule, kExportNames, kExportCount, edvr_realProcs_d3d11,
+        loaded, kExportNames, kExportCount, edvr_realProcs_d3d11,
         reinterpret_cast<void*>(&edvr_unresolved_d3d11));
 
-    g_realCreateDevice = reinterpret_cast<PFN_D3D11CreateDevice>(
-        GetProcAddress(g_realModule, "D3D11CreateDevice"));
-    g_realCreateDeviceAndSwapChain = reinterpret_cast<PFN_D3D11CreateDeviceAndSwapChain>(
-        GetProcAddress(g_realModule, "D3D11CreateDeviceAndSwapChain"));
+    auto* loadedCreate = reinterpret_cast<PFN_D3D11CreateDevice>(
+        GetProcAddress(loaded, "D3D11CreateDevice"));
+    auto* loadedSwap = reinterpret_cast<PFN_D3D11CreateDeviceAndSwapChain>(
+        GetProcAddress(loaded, "D3D11CreateDeviceAndSwapChain"));
+    g_realCreateDevice.store(loadedCreate, std::memory_order_release);
+    g_realCreateDeviceAndSwapChain.store(loadedSwap, std::memory_order_release);
 
-    g_systemCreateDevice = g_realCreateDevice;
-    g_systemCreateDeviceAndSwapChain = g_realCreateDeviceAndSwapChain;
+    // Do NOT seed g_systemCreateDevice* from the unverified loader-phase handle here:
+    // if LoadLibrary was redirected to a chained proxy, re-entrant device creation must
+    // only escape through exports resolved from a verified System32 d3d11.dll (#255).
 
-    edvr::breadcrumb(g_realCreateDevice ? "gfx: exports resolved, loader phase done"
-                                        : "gfx: FAILED no D3D11CreateDevice");
+    edvr::breadcrumb(loadedCreate ? "gfx: exports resolved, loader phase done"
+                                  : "gfx: FAILED no D3D11CreateDevice");
 }
+
+}  // namespace
+
+namespace edvr {
+static HMODULE probeSystemModule();
+static HMODULE probeSystemModuleForChain();
+}  // namespace edvr
+
+namespace {
 
 // Reads the bytes of a resolved settings path (up to 16 MiB); empty when absent.
 std::string iniTextAt(const std::wstring& path) {
@@ -392,20 +409,24 @@ void chainThroughOtherProxy(edvr::Config& cfg) {
         return;
     }
 
-    // Prefer the chained module, fall back to the system copy for anything it
-    // does not export. EDHM and ReShade wrap the entry points they care about
-    // and no more; without the fallback the rest would become no-op stubs and
-    // the game would lose functions that work fine in the system dll.
+    // Prefer the chained module, fall back to the verified System32 copy for
+    // anything it does not export. EDHM and ReShade wrap the entry points they
+    // care about and no more; without the fallback the rest would become no-op
+    // stubs and the game would lose functions that work fine in the system dll.
+    const HMODULE sysFallback = edvr::probeSystemModuleForChain();
     size_t fromSystem = 0;
     const size_t missing = edvr::resolveProcsChained(
-        chained, g_systemModule, kExportNames, kExportCount, edvr_realProcs_d3d11,
+        chained, sysFallback, kExportNames, kExportCount, edvr_realProcs_d3d11,
         reinterpret_cast<void*>(&edvr_unresolved_d3d11), &fromSystem);
 
-    g_realModule = chained;
-    g_realCreateDevice = create;
+    g_realModule.store(chained, std::memory_order_release);
+    g_realCreateDevice.store(create, std::memory_order_release);
     if (auto* swap = reinterpret_cast<PFN_D3D11CreateDeviceAndSwapChain>(
             GetProcAddress(chained, "D3D11CreateDeviceAndSwapChain"))) {
-        g_realCreateDeviceAndSwapChain = swap;
+        g_realCreateDeviceAndSwapChain.store(swap, std::memory_order_release);
+    } else if (auto* sysSwap =
+                   g_systemCreateDeviceAndSwapChain.load(std::memory_order_acquire)) {
+        g_realCreateDeviceAndSwapChain.store(sysSwap, std::memory_order_release);
     }
     // else: keep the system one resolved during the loader phase.
 
@@ -433,8 +454,13 @@ void chainThroughOtherProxy(edvr::Config& cfg) {
 }
 
 INIT_ONCE g_initOnce = INIT_ONCE_STATIC_INIT;
+thread_local bool g_inInitOnce = false;
 
 BOOL CALLBACK initOnceCallback(PINIT_ONCE, PVOID, PVOID*) {
+    struct InitOnceScope {
+        InitOnceScope() noexcept { g_inInitOnce = true; }
+        ~InitOnceScope() noexcept { g_inInitOnce = false; }
+    } initScope;
     edvr::breadcrumb("gfx: first export call, opening log");
     edvr::Config& cfg = edvr::Config::get();
     cfg.init(*g_moduleDir);
@@ -526,15 +552,66 @@ BOOL CALLBACK initOnceCallback(PINIT_ONCE, PVOID, PVOID*) {
     // through; only ShowCursor's count is changed, and only while the cursor is hidden. The game's mouse lock is not touched. A flat-only install has no desktop window and no hooks.
     if (edvr::runtimeScopeIncludesVr()) edvr::desktopWindowCursorInstall();
 
-    // Now, out from under the loader lock, is when another proxy can safely be
-    // brought in.
+    // Now, out from under the loader lock, verify the System32 d3d11.dll handle
+    // (re-resolving g_systemCreateDevice* if DllMain's load was redirected) and
+    // repair loader-phase exports before bringing in any chained proxy:
+    // - If DllMain had no usable handle (null or self), switch wholly to sysFallback
+    //   so g_realModule, edvr_realProcs_d3d11, and g_realCreateDevice* stay aligned.
+    // - If DllMain loaded a valid redirected proxy that missed some exports, keep
+    //   it as g_realModule and fill only the missing slots from sysFallback (#255).
+    const HMODULE sysFallback = edvr::probeSystemModuleForChain();
+    const HMODULE loaderMod = g_realModule.load(std::memory_order_acquire);
+    if (sysFallback && sysFallback != loaderMod) {
+        if (!loaderMod || loaderMod == g_selfModule) {
+            g_realModule.store(sysFallback, std::memory_order_release);
+            g_missingExports = edvr::resolveProcs(
+                sysFallback, kExportNames, kExportCount, edvr_realProcs_d3d11,
+                reinterpret_cast<void*>(&edvr_unresolved_d3d11));
+            g_realCreateDevice.store(
+                reinterpret_cast<PFN_D3D11CreateDevice>(
+                    GetProcAddress(sysFallback, "D3D11CreateDevice")),
+                std::memory_order_release);
+            g_realCreateDeviceAndSwapChain.store(
+                reinterpret_cast<PFN_D3D11CreateDeviceAndSwapChain>(
+                    GetProcAddress(sysFallback, "D3D11CreateDeviceAndSwapChain")),
+                std::memory_order_release);
+        } else if (g_missingExports > 0) {
+            size_t fromSystem = 0;
+            g_missingExports = edvr::resolveProcsChained(
+                loaderMod, sysFallback, kExportNames, kExportCount, edvr_realProcs_d3d11,
+                reinterpret_cast<void*>(&edvr_unresolved_d3d11), &fromSystem);
+            if (fromSystem > 0) {
+                edvr::Log::get().note(
+                    "d3d11 proxy: filled %zu missing loader-phase export(s) from System32 d3d11.dll",
+                    fromSystem);
+            }
+        }
+    }
+    if (!g_realCreateDevice.load(std::memory_order_acquire)) {
+        if (auto* sysCreate = g_systemCreateDevice.load(std::memory_order_acquire)) {
+            g_realCreateDevice.store(sysCreate, std::memory_order_release);
+        }
+    }
+    if (!g_realCreateDeviceAndSwapChain.load(std::memory_order_acquire)) {
+        if (auto* sysSwap = g_systemCreateDeviceAndSwapChain.load(std::memory_order_acquire)) {
+            g_realCreateDeviceAndSwapChain.store(sysSwap, std::memory_order_release);
+        }
+    }
     chainThroughOtherProxy(cfg);
+    // Mark startup export resolution finished under g_systemModuleLock so any later
+    // System32 verification refreshes missing chained/fallback export slots atomically (#255).
+    {
+        AcquireSRWLockExclusive(&g_systemModuleLock);
+        g_initOnceExportsDone = true;
+        ReleaseSRWLockExclusive(&g_systemModuleLock);
+    }
 
     // Which DLL is really being forwarded to, asked of the module itself rather
     // than assumed -- intent and outcome can differ. If someone reports that
     // another mod stopped working, this line is the first thing worth seeing.
     wchar_t realPath[MAX_PATH]{};
-    const DWORD n = g_realModule ? GetModuleFileNameW(g_realModule, realPath, MAX_PATH) : 0;
+    const HMODULE activeReal = g_realModule.load(std::memory_order_acquire);
+    const DWORD n = activeReal ? GetModuleFileNameW(activeReal, realPath, MAX_PATH) : 0;
     if (n == 0 || n >= MAX_PATH) wcscpy_s(realPath, L"(unknown)");
     edvr::Log::get().note("forwarding to %S", realPath);
     edvr::breadcrumb("gfx: log open");
@@ -548,6 +625,7 @@ BOOL CALLBACK initOnceCallback(PINIT_ONCE, PVOID, PVOID*) {
 }
 
 void ensureInitialised() {
+    if (g_inInitOnce) return;
     InitOnceExecuteOnce(&g_initOnce, initOnceCallback, nullptr, nullptr);
 }
 
@@ -596,11 +674,10 @@ struct CreateDepth {
     bool reentrant() const { return g_createDepth > 1; }
 };
 
-bool g_loopReported = false;
+std::atomic<bool> g_loopReported{false};
 
 void reportLoopOnce() {
-    if (g_loopReported) return;
-    g_loopReported = true;
+    if (g_loopReported.exchange(true, std::memory_order_relaxed)) return;
     // A breadcrumb as well as the log: breadcrumbs are written immediately with
     // no buffering, so they survive whatever happens next.
     edvr::breadcrumb("gfx: chained proxy called us back, routing it to the system dll");
@@ -651,47 +728,143 @@ namespace edvr {
 // decided in DllMain, where nothing can be looked up safely; it is decided here, at the first probe, when the device
 // exists and so System32's d3d11.dll is mapped.
 //
-// A verified answer is kept. An unverified one (System32's module not found mapped) is asked again at each call, so a
-// module that was not yet mapped at the first call is still found at the next; it says so each time, three calls
-// a device at most.
-static HMODULE probeSystemModule() {
+// A verified answer is kept and reused by every caller (startup chaining,
+// re-entrant device creation, context probe, and slot reclaim). An unverified
+// answer (System32's module not yet mapped) is re-checked on later calls until
+// System32 maps; the unverified warning logs once at the context probe so early
+// startup calls before device creation do not emit a misplaced probe warning.
+static HMODULE probeSystemModuleImpl(bool fromContextProbe, HMODULE* fallbackOut) {
     static std::atomic<HMODULE> verified{nullptr};
-    if (HMODULE known = verified.load(std::memory_order_acquire)) return known;
+    if (HMODULE known = verified.load(std::memory_order_acquire)) {
+        if (fallbackOut) *fallbackOut = g_systemFallbackModule.load(std::memory_order_acquire);
+        return known;
+    }
 
-    const SystemD3D11Choice choice = chooseSystemD3D11(g_systemModule);
+    AcquireSRWLockExclusive(&g_systemModuleLock);
+    struct UnlockGuard {
+        ~UnlockGuard() { ReleaseSRWLockExclusive(&g_systemModuleLock); }
+    } unlockGuard;
+
+    if (HMODULE known = verified.load(std::memory_order_acquire)) {
+        if (fallbackOut) *fallbackOut = g_systemFallbackModule.load(std::memory_order_acquire);
+        return known;
+    }
+
+    SystemD3D11Choice choice = chooseSystemD3D11(g_systemModule);
+    if (choice.verified) {
+        // Pin any discovered System32 handle ("by-name" / "walked") and revalidate its path
+        // BEFORE GetProcAddress or caching; a failed pin demotes choice back to unverified
+        // so later probes retry instead of caching a stale handle or null exports (#255).
+        (void)pinVerifiedSystemD3D11(choice, g_systemModule);
+    }
+    // Pass nullptr fallbacks so g_systemCreateDevice* ONLY ever store exports from a
+    // verified System32 d3d11.dll, never an unverified loader-phase handle (#255).
+    const SystemD3D11Exports resolved = resolveSystemD3D11ExportsFrom(
+        choice, g_selfModule, nullptr, nullptr);
     const wchar_t* held = choice.heldPath.empty() ? L"(no module)" : choice.heldPath.c_str();
     const wchar_t* wanted = choice.wantedPath.empty() ? L"<System32>\\d3d11.dll" : choice.wantedPath.c_str();
     if (!choice.verified) {
-        Log::get().note(
-            "system d3d11.dll: LoadLibrary returned %S for %S at startup, and System32's own module could "
-            "not be found mapped, so the context probe and slot reclaim use that handle as it is, UNVERIFIED. "
-            "If the probe below says 0 of 96 sampled entries are inside Windows' d3d11.dll, this is the "
-            "first place to look.",
-            held, wanted);
+        if (fromContextProbe) {
+            static bool unverifiedLogged = false;
+            if (!unverifiedLogged) {
+                unverifiedLogged = true;
+                Log::get().note(
+                    "system d3d11.dll: LoadLibrary returned %S for %S at startup, and System32's own module could "
+                    "not be found mapped, so the context probe, slot reclaim, and chained fallback use that handle "
+                    "as it is, UNVERIFIED (re-entrant device creation refuses to fall back to it). If the probe "
+                    "below says 0 of 96 sampled entries are inside Windows' d3d11.dll, this is the first place to look.",
+                    held, wanted);
+            }
+        }
+        if (fallbackOut) *fallbackOut = resolved.fallbackModule;
         return choice.module;
     }
     if (std::strcmp(choice.route, "held") == 0) {
         Log::get().note(
             "system d3d11.dll: the module LoadLibrary returned at startup is Windows' own (%S); the context "
-            "probe and slot reclaim name it.",
+            "probe, slot reclaim, re-entrant device creation, and chained fallback name it.",
             held);
     } else {
         Log::get().note(
             "system d3d11.dll: LoadLibrary returned %S for %S at startup -- NOT Windows' own. Something "
             "answered that load with a different module; a hook on LoadLibraryExW returning its own d3d11.dll "
-            "is the known way (3Dmigoto and EDHM with load_library_redirect = 2). The context probe and slot "
-            "reclaim use the System32 module found mapped instead (%p, by %s). Counted against the handle "
-            "at startup, a context whose methods are all Windows' own reads as a wrapper's, and reclaim "
-            "adopts none of Windows' own re-points of ED-UP's hooks.",
+            "is the known way (3Dmigoto and EDHM with load_library_redirect = 2). The context probe, slot "
+            "reclaim, re-entrant device creation, and chained fallback use the System32 module found mapped "
+            "instead (%p, by %s). Counted against the handle at startup, a context whose methods are all "
+            "Windows' own reads as a wrapper's, and reclaim adopts none of Windows' own re-points of ED-UP's hooks.",
             held, wanted, static_cast<void*>(choice.module), choice.route);
-        // The DllMain load held a reference for the process lifetime; this one is found, not loaded, so it takes its
-        // own. FROM_ADDRESS with the base address, which lies inside the module.
-        HMODULE pinned = nullptr;
-        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                           reinterpret_cast<LPCWSTR>(choice.module), &pinned);
+    }
+    if (resolved.missingCreateDevice || resolved.missingCreateDeviceAndSwapChain) {
+        Log::get().note(
+            "system d3d11.dll: verified module (%p) missing export(s) (D3D11CreateDevice=%s, "
+            "D3D11CreateDeviceAndSwapChain=%s); keeping previous fallback proc.",
+            static_cast<void*>(choice.module),
+            resolved.missingCreateDevice ? "missing" : "ok",
+            resolved.missingCreateDeviceAndSwapChain ? "missing" : "ok");
+    }
+    g_systemCreateDevice.store(
+        reinterpret_cast<PFN_D3D11CreateDevice>(resolved.createDevice),
+        std::memory_order_release);
+    g_systemCreateDeviceAndSwapChain.store(
+        reinterpret_cast<PFN_D3D11CreateDeviceAndSwapChain>(resolved.createDeviceAndSwapChain),
+        std::memory_order_release);
+    g_systemFallbackModule.store(resolved.fallbackModule, std::memory_order_release);
+    // If startup chaining populated edvr_realProcs_d3d11 before System32 mapped (e.g. redirected
+    // DllMain load and a chained proxy that maps System32 on its first D3D11CreateDevice call),
+    // refresh any slots not exported by g_realModule so they forward to verified System32 (#255).
+    if (g_initOnceExportsDone && resolved.fallbackModule) {
+        const HMODULE realMod = g_realModule.load(std::memory_order_acquire);
+        size_t refreshed = 0;
+        if (!realMod || realMod == g_selfModule) {
+            g_realModule.store(resolved.fallbackModule, std::memory_order_release);
+            edvr::refreshChainedExports(
+                resolved.fallbackModule, nullptr, kExportNames, kExportCount, edvr_realProcs_d3d11,
+                reinterpret_cast<void*>(&edvr_unresolved_d3d11), &refreshed);
+            if (resolved.createDevice) {
+                g_realCreateDevice.store(
+                    reinterpret_cast<PFN_D3D11CreateDevice>(resolved.createDevice),
+                    std::memory_order_release);
+            }
+            if (resolved.createDeviceAndSwapChain) {
+                g_realCreateDeviceAndSwapChain.store(
+                    reinterpret_cast<PFN_D3D11CreateDeviceAndSwapChain>(
+                        resolved.createDeviceAndSwapChain),
+                    std::memory_order_release);
+            }
+        } else if (realMod != resolved.fallbackModule) {
+            edvr::refreshChainedExports(
+                realMod, resolved.fallbackModule, kExportNames, kExportCount, edvr_realProcs_d3d11,
+                reinterpret_cast<void*>(&edvr_unresolved_d3d11), &refreshed);
+            if (!GetProcAddress(realMod, "D3D11CreateDevice") && resolved.createDevice) {
+                g_realCreateDevice.store(
+                    reinterpret_cast<PFN_D3D11CreateDevice>(resolved.createDevice),
+                    std::memory_order_release);
+            }
+            if (!GetProcAddress(realMod, "D3D11CreateDeviceAndSwapChain") &&
+                resolved.createDeviceAndSwapChain) {
+                g_realCreateDeviceAndSwapChain.store(
+                    reinterpret_cast<PFN_D3D11CreateDeviceAndSwapChain>(
+                        resolved.createDeviceAndSwapChain),
+                    std::memory_order_release);
+            }
+        }
+        if (refreshed > 0) {
+            Log::get().note(
+                "system d3d11.dll: refreshed %zu forwarding export(s) from verified System32 d3d11.dll",
+                refreshed);
+        }
     }
     verified.store(choice.module, std::memory_order_release);
+    if (fallbackOut) *fallbackOut = resolved.fallbackModule;
     return choice.module;
+}
+
+static HMODULE probeSystemModule() { return probeSystemModuleImpl(true, nullptr); }
+
+static HMODULE probeSystemModuleForChain() {
+    HMODULE fallback = nullptr;
+    probeSystemModuleImpl(false, &fallback);
+    return fallback;
 }
 
 void* systemD3D11Module() { return probeSystemModule(); }
@@ -854,24 +1027,56 @@ extern "C" HRESULT WINAPI edvr_impl_D3D11CreateDevice(
     const D3D_FEATURE_LEVEL* featureLevels, UINT numFeatureLevels, UINT sdkVersion,
     ID3D11Device** ppDevice, D3D_FEATURE_LEVEL* pFeatureLevel,
     ID3D11DeviceContext** ppContext) {
-    if (!g_realCreateDevice) return E_FAIL;
-    ensureInitialised();
-
+    // Track re-entry BEFORE ensureInitialised(): if a chained proxy loaded during
+    // initOnceCallback calls back into D3D11CreateDevice from its DllMain on this
+    // thread, re-entering InitOnceExecuteOnce would deadlock at launch (#255).
     CreateDepth depth;
-    PFN_D3D11CreateDevice target = g_realCreateDevice;
-    if (depth.reentrant()) {
+    const bool inInitOnce = g_inInitOnce;
+    const bool reentrant = depth.reentrant() || inInitOnce;
+    if (!reentrant) {
+        ensureInitialised();
+    }
+
+    if (reentrant) {
         reportLoopOnce();
-        target = g_systemCreateDevice ? g_systemCreateDevice : g_realCreateDevice;
-    } else {
+        if (!inInitOnce) {
+            edvr::probeSystemModuleForChain();
+        }
+    } else if (!g_realCreateDevice.load(std::memory_order_acquire)) {
+        edvr::probeSystemModuleForChain();
+    }
+    auto* realCreate = g_realCreateDevice.load(std::memory_order_acquire);
+    auto* sysCreate = g_systemCreateDevice.load(std::memory_order_acquire);
+    auto target = reinterpret_cast<PFN_D3D11CreateDevice>(edvr::selectCreateDeviceProc(
+        reentrant, reinterpret_cast<FARPROC>(realCreate),
+        reinterpret_cast<FARPROC>(sysCreate)));
+    if (!target) {
+        if (reentrant) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                edvr::Log::get().note(
+                    "d3d11 proxy: re-entrant D3D11CreateDevice aborted because System32 d3d11.dll could not be "
+                    "verified; refusing to recurse back into the unverified loader-phase target.");
+            }
+        }
+        return E_FAIL;
+    }
+    if (!reentrant) {
         edvr::gameVramInstall(adapter);
     }
 
     const HRESULT hr =
         target(adapter, driverType, software, flags, featureLevels,
                numFeatureLevels, sdkVersion, ppDevice, pFeatureLevel, ppContext);
+    // If a chained proxy mapped System32's d3d11.dll during this outermost call without
+    // calling back into us (including a null-ppDevice feature-level probe), verify it
+    // now so any missing chained exports refresh before control returns to the game (#255).
+    if (!reentrant) {
+        edvr::probeSystemModuleForChain();
+    }
     // Only hook on the way out of the OUTERMOST call. Hooking the device a
     // second time on the way back up would install our vtable copy twice.
-    if (SUCCEEDED(hr) && ppDevice && *ppDevice && !depth.reentrant()) {
+    if (SUCCEEDED(hr) && ppDevice && *ppDevice && !reentrant) {
         edvr::gameVramNoteDevice(*ppDevice);
         attachToDevice(*ppDevice, nullptr, driverType, flags, hr);
     }
@@ -884,23 +1089,48 @@ extern "C" HRESULT WINAPI edvr_impl_D3D11CreateDeviceAndSwapChain(
     const DXGI_SWAP_CHAIN_DESC* swapChainDesc, IDXGISwapChain** ppSwapChain,
     ID3D11Device** ppDevice, D3D_FEATURE_LEVEL* pFeatureLevel,
     ID3D11DeviceContext** ppContext) {
-    if (!g_realCreateDeviceAndSwapChain) return E_FAIL;
-    ensureInitialised();
-
     CreateDepth depth;
-    PFN_D3D11CreateDeviceAndSwapChain target = g_realCreateDeviceAndSwapChain;
-    if (depth.reentrant()) {
+    const bool inInitOnce = g_inInitOnce;
+    const bool reentrant = depth.reentrant() || inInitOnce;
+    if (!reentrant) {
+        ensureInitialised();
+    }
+
+    if (reentrant) {
         reportLoopOnce();
-        target = g_systemCreateDeviceAndSwapChain ? g_systemCreateDeviceAndSwapChain
-                                                  : g_realCreateDeviceAndSwapChain;
-    } else {
+        if (!inInitOnce) {
+            edvr::probeSystemModuleForChain();
+        }
+    } else if (!g_realCreateDeviceAndSwapChain.load(std::memory_order_acquire)) {
+        edvr::probeSystemModuleForChain();
+    }
+    auto* realSwap = g_realCreateDeviceAndSwapChain.load(std::memory_order_acquire);
+    auto* sysSwap = g_systemCreateDeviceAndSwapChain.load(std::memory_order_acquire);
+    auto target = reinterpret_cast<PFN_D3D11CreateDeviceAndSwapChain>(edvr::selectCreateDeviceProc(
+        reentrant, reinterpret_cast<FARPROC>(realSwap),
+        reinterpret_cast<FARPROC>(sysSwap)));
+    if (!target) {
+        if (reentrant) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                edvr::Log::get().note(
+                    "d3d11 proxy: re-entrant D3D11CreateDeviceAndSwapChain aborted because System32 d3d11.dll could "
+                    "not be verified; refusing to recurse back into the unverified loader-phase target.");
+            }
+        }
+        return E_FAIL;
+    }
+    if (!reentrant) {
         edvr::gameVramInstall(adapter);
     }
 
     const HRESULT hr = target(
         adapter, driverType, software, flags, featureLevels, numFeatureLevels, sdkVersion,
         swapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppContext);
-    if (SUCCEEDED(hr) && ppDevice && *ppDevice && !depth.reentrant()) {
+    if (!reentrant) {
+        edvr::probeSystemModuleForChain();
+    }
+    if (SUCCEEDED(hr) && ppDevice && *ppDevice && !reentrant) {
         edvr::gameVramNoteDevice(*ppDevice);
         attachToDevice(*ppDevice, ppSwapChain ? *ppSwapChain : nullptr, driverType, flags, hr);
     }

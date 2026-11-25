@@ -19,13 +19,18 @@ HMODULE g_system = nullptr;
 
 typedef HRESULT(WINAPI* PFN_Create)(void*, UINT, HMODULE, UINT, const void*, UINT, UINT,
                                     void**, UINT*, void**);
+typedef HRESULT(WINAPI* PFN_CreateSwap)(void*, UINT, HMODULE, UINT, const void*, UINT, UINT,
+                                        const void*, void**, void**, UINT*, void**);
 
 void marker(const char* what) {
-    char path[MAX_PATH];
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    char* slash = strrchr(path, '\\');
-    if (slash) *(slash + 1) = 0;
-    strcat_s(path, MAX_PATH, "fakechain_was_here.txt");
+    char path[MAX_PATH]{};
+    const DWORD envLen = GetEnvironmentVariableA("EDVR_FAKECHAIN_MARKER", path, MAX_PATH);
+    if (envLen == 0 || envLen >= MAX_PATH) {
+        GetModuleFileNameA(nullptr, path, MAX_PATH);
+        char* slash = strrchr(path, '\\');
+        if (slash) *(slash + 1) = 0;
+        strcat_s(path, MAX_PATH, "fakechain_was_here.txt");
+    }
 
     HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -34,6 +39,40 @@ void marker(const char* what) {
     WriteFile(f, what, static_cast<DWORD>(strlen(what)), &n, nullptr);
     WriteFile(f, "\r\n", 2, &n, nullptr);
     CloseHandle(f);
+}
+
+void maybeCallbackDuringAttach() {
+    char callName[64]{};
+    const DWORD callLen = GetEnvironmentVariableA("EDVR_FAKECHAIN_ATTACH_CALL", callName, sizeof(callName));
+    if (callLen == 0 || callLen >= sizeof(callName)) return;
+
+    HMODULE proxy = nullptr;
+    char proxyPath[MAX_PATH]{};
+    const DWORD pathLen = GetEnvironmentVariableA("EDVR_FAKECHAIN_PROXY_PATH", proxyPath, MAX_PATH);
+    if (pathLen > 0 && pathLen < MAX_PATH) {
+        proxy = GetModuleHandleA(proxyPath);
+    }
+    if (!proxy) proxy = GetModuleHandleW(L"d3d11.dll");
+    if (!proxy) return;
+
+    // Pass D3D_DRIVER_TYPE_UNKNOWN (0) with null adapter so once ED-UP breaks the
+    // InitOnce startup deadlock and routes to System32 (or returns E_FAIL), the
+    // callback returns immediately without creating a device under loader lock (#255).
+    if (strcmp(callName, "D3D11CreateDevice") == 0) {
+        auto fn = reinterpret_cast<PFN_Create>(GetProcAddress(proxy, "D3D11CreateDevice"));
+        if (fn) {
+            (void)fn(nullptr, 0, nullptr, 0, nullptr, 0, 7, nullptr, nullptr, nullptr);
+            marker("attach callback D3D11CreateDevice returned");
+        }
+    } else if (strcmp(callName, "D3D11CreateDeviceAndSwapChain") == 0) {
+        auto fn = reinterpret_cast<PFN_CreateSwap>(
+            GetProcAddress(proxy, "D3D11CreateDeviceAndSwapChain"));
+        if (fn) {
+            (void)fn(nullptr, 0, nullptr, 0, nullptr, 0, 7, nullptr, nullptr, nullptr, nullptr,
+                     nullptr);
+            marker("attach callback D3D11CreateDeviceAndSwapChain returned");
+        }
+    }
 }
 
 }  // namespace
@@ -70,6 +109,7 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
         // Deliberately non-trivial, the way a real mod's entry point is. Under
         // the loader lock this is the sort of thing that goes wrong.
         marker("fakechain DllMain ran");
+        maybeCallbackDuringAttach();
     }
     return TRUE;
 }

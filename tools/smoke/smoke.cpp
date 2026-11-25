@@ -33,6 +33,11 @@ namespace {
 typedef HRESULT(WINAPI* PFN_Create)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
                                     const D3D_FEATURE_LEVEL*, UINT, UINT, ID3D11Device**,
                                     D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
+typedef HRESULT(WINAPI* PFN_CreateSwap)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
+                                        const D3D_FEATURE_LEVEL*, UINT, UINT,
+                                        const DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**,
+                                        ID3D11Device**, D3D_FEATURE_LEVEL*,
+                                        ID3D11DeviceContext**);
 
 int fail(const char* what) {
     printf("  FAIL  %s\n", what);
@@ -287,11 +292,160 @@ int reexecWith(int argc, char** argv, const char* sw) {
     return static_cast<int>(code);
 }
 
+int runChainAttachReentryChild(const char* exportName, const char* stagedProxy,
+                               const char* markerPath) {
+    SetEnvironmentVariableA("EDVR_FAKECHAIN_ATTACH_CALL", exportName);
+    SetEnvironmentVariableA("EDVR_FAKECHAIN_PROXY_PATH", stagedProxy);
+    SetEnvironmentVariableA("EDVR_FAKECHAIN_MARKER", markerPath);
+    HMODULE mod = LoadLibraryA(stagedProxy);
+    if (!mod) return fail("chain-reentry child: staged proxy did not load");
+    if (strcmp(exportName, "D3D11CreateDevice") == 0) {
+        auto fn = reinterpret_cast<PFN_Create>(GetProcAddress(mod, "D3D11CreateDevice"));
+        if (!fn) return fail("chain-reentry child: D3D11CreateDevice missing");
+        (void)fn(nullptr, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+                 nullptr, nullptr, nullptr);
+    } else if (strcmp(exportName, "D3D11CreateDeviceAndSwapChain") == 0) {
+        auto fn = reinterpret_cast<PFN_CreateSwap>(
+            GetProcAddress(mod, "D3D11CreateDeviceAndSwapChain"));
+        if (!fn) return fail("chain-reentry child: D3D11CreateDeviceAndSwapChain missing");
+        (void)fn(nullptr, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+                 nullptr, nullptr, nullptr, nullptr, nullptr);
+    } else {
+        return fail("chain-reentry child: unknown export");
+    }
+    return 0;
+}
+
+std::string readTextFile(const char* path) {
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return std::string();
+    std::string out;
+    char buf[1024];
+    DWORD got = 0;
+    while (ReadFile(f, buf, sizeof(buf), &got, nullptr) && got > 0) {
+        out.append(buf, got);
+    }
+    CloseHandle(f);
+    return out;
+}
+
+// Exercises both D3D11CreateDevice and D3D11CreateDeviceAndSwapChain when a chained
+// advanced.real_dll calls back into the same export from its DllMain during proxy
+// InitOnce startup (#255). Runs each case in a child process with a hard timeout so
+// a startup InitOnce deadlock fails deterministically instead of hanging CI.
+int runChainAttachReentry(const char* proxy, const char* fakechainPath) {
+    char proxyFull[MAX_PATH]{}, chainFull[MAX_PATH]{}, tempDir[MAX_PATH]{}, exePath[MAX_PATH]{};
+    if (!GetFullPathNameA(proxy, MAX_PATH, proxyFull, nullptr)) return fail("GetFullPathName(proxy)");
+    if (!GetFullPathNameA(fakechainPath, MAX_PATH, chainFull, nullptr)) return fail("GetFullPathName(fakechain)");
+    const DWORD tLen = GetTempPathA(MAX_PATH, tempDir);
+    if (!tLen || tLen >= MAX_PATH) return fail("GetTempPathA");
+    if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH)) return fail("GetModuleFileNameA");
+
+    char stageDir[MAX_PATH]{};
+    snprintf(stageDir, sizeof(stageDir), "%sedvr_smoke_chain_reentry_%lu",
+             tempDir, static_cast<unsigned long>(GetCurrentProcessId()));
+    CreateDirectoryA(stageDir, nullptr);
+
+    const std::string stagedProxy = std::string(stageDir) + "\\d3d11.dll";
+    const std::string stagedChain = std::string(stageDir) + "\\fakechain.dll";
+    const std::string stagedIni = std::string(stageDir) + "\\edup.ini";
+    const std::string markerPath = std::string(stageDir) + "\\marker.txt";
+
+    auto cleanup = [&]() {
+        DeleteFileA(markerPath.c_str());
+        DeleteFileA(stagedIni.c_str());
+        DeleteFileA(stagedChain.c_str());
+        DeleteFileA(stagedProxy.c_str());
+        RemoveDirectoryA(stageDir);
+    };
+
+    if (!CopyFileA(proxyFull, stagedProxy.c_str(), FALSE)) {
+        cleanup();
+        return fail("could not stage d3d11.dll for chain-attach reentry test");
+    }
+    if (!CopyFileA(chainFull, stagedChain.c_str(), FALSE)) {
+        cleanup();
+        return fail("could not stage fakechain.dll for chain-attach reentry test");
+    }
+    {
+        HANDLE f = CreateFileA(stagedIni.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) {
+            cleanup();
+            return fail("could not write edup.ini for chain-attach reentry test");
+        }
+        const char ini[] = "[advanced]\r\nreal_dll = fakechain.dll\r\nd3d11_fixes = 0\r\n";
+        DWORD wrote = 0;
+        const BOOL ok = WriteFile(f, ini, sizeof(ini) - 1, &wrote, nullptr);
+        CloseHandle(f);
+        if (!ok || wrote != sizeof(ini) - 1) {
+            cleanup();
+            return fail("could not populate edup.ini for chain-attach reentry test");
+        }
+    }
+
+    const char* const kExports[2] = {"D3D11CreateDevice", "D3D11CreateDeviceAndSwapChain"};
+    for (const char* exp : kExports) {
+        DeleteFileA(markerPath.c_str());
+        std::string cmd = std::string("\"") + exePath + "\" \"" + stagedProxy +
+                          "\" --chain-attach-reentry-child " + exp + " \"" + markerPath + "\"";
+        std::vector<char> cmdBuf(cmd.begin(), cmd.end());
+        cmdBuf.push_back('\0');
+        STARTUPINFOA si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessA(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                            &si, &pi)) {
+            cleanup();
+            return fail("could not launch chain-attach reentry child");
+        }
+        const DWORD wait = WaitForSingleObject(pi.hProcess, 15000);
+        if (wait == WAIT_TIMEOUT) {
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            cleanup();
+            printf("  FAIL  %s deadlocked when chained DLL called back during DllMain attach\n", exp);
+            return 1;
+        }
+        DWORD code = 1;
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        if (wait != WAIT_OBJECT_0 || code != 0) {
+            cleanup();
+            printf("  FAIL  %s chain-attach reentry child exited %lu\n",
+                   exp, static_cast<unsigned long>(code));
+            return 1;
+        }
+        const std::string log = readTextFile(markerPath.c_str());
+        const std::string want = std::string("attach callback ") + exp + " returned";
+        if (log.find("fakechain DllMain ran") == std::string::npos ||
+            log.find(want) == std::string::npos) {
+            cleanup();
+            printf("  FAIL  %s chain-attach callback did not complete (marker: %s)\n",
+                   exp, log.c_str());
+            return 1;
+        }
+        printf("  ok    %s survived chained DllMain callback without InitOnce deadlock\n", exp);
+    }
+
+    cleanup();
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     const char* proxy = argc > 1 ? argv[1] : "build\\d3d11.dll";
+    if (argc > 4 && strcmp(argv[2], "--chain-attach-reentry-child") == 0) {
+        return runChainAttachReentryChild(argv[3], proxy, argv[4]);
+    }
+    if (argc > 3 && strcmp(argv[2], "--chain-attach-reentry") == 0) {
+        return runChainAttachReentry(proxy, argv[3]);
+    }
     const bool recoveryCheck = argc > 2 && strcmp(argv[2], "--recovery-device") == 0;
     const bool foreignCheck = argc > 2 && strcmp(argv[2], "--foreign-device") == 0;
     const bool offCheck = argc > 2 && strcmp(argv[2], "--fixes-off-device") == 0;

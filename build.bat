@@ -1204,6 +1204,14 @@ REM rig (each clears the sentinel it uses first), under this rig's own EDUP_LOG_
     echo [edup] ERROR: smoke --foreign-device failed
     exit /b 1
 )
+%CC% /nologo /W4 /O2 /EHsc /std:c++17 /MT /DNDEBUG /LD ^
+    /Fo"%OBJ%\smoke\\" /Fe"%OBJ%\smoke\fakechain.dll" ^
+    "tools\fakechain\fakechain.cpp" /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edup] ERROR: smoke fakechain build failed & exit /b 1 )
+"%BUILD%\smoke.exe" "%BUILD%\d3d11.dll" --chain-attach-reentry "%OBJ%\smoke\fakechain.dll" || (
+    echo [edup] ERROR: smoke --chain-attach-reentry failed: chained DllMain callback deadlocked startup
+    exit /b 1
+)
 exit /b 0
 
 :rig_fakechain

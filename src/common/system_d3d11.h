@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -212,6 +213,123 @@ inline SystemD3D11Choice chooseSystemD3D11(HMODULE held) {
         out.verified = true;
     }
     return out;
+}
+
+// Pins a verified System32 handle discovered without a refcount ("by-name" / "walked")
+// BEFORE resolving exports or caching it (#255). Revalidates the pinned handle and its
+// real path against choice.wantedPath so an intervening unload or module replacement
+// demotes choice back to unverified/unresolved instead of publishing a stale handle.
+inline bool pinVerifiedSystemD3D11(SystemD3D11Choice& choice, HMODULE fallbackHeld) {
+    if (!choice.verified || !choice.module) return false;
+    if (choice.route && std::strcmp(choice.route, "held") == 0) return true;
+    HMODULE pinned = nullptr;
+    const BOOL ok = GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        reinterpret_cast<LPCWSTR>(choice.module), &pinned);
+    wchar_t actual[MAX_PATH]{};
+    const DWORD len = (ok && pinned) ? GetModuleFileNameW(pinned, actual, MAX_PATH) : 0;
+    const bool pathOk = ok && pinned == choice.module && len > 0 && len < MAX_PATH &&
+                        !choice.wantedPath.empty() && _wcsicmp(actual, choice.wantedPath.c_str()) == 0;
+    if (!pathOk) {
+        if (ok && pinned) FreeLibrary(pinned);
+        choice.verified = false;
+        choice.module = fallbackHeld;
+        choice.route = "unresolved";
+        return false;
+    }
+    return true;
+}
+
+// Re-resolved device-creation exports and chained-proxy fallback from chooseSystemD3D11().
+struct SystemD3D11Exports {
+    SystemD3D11Choice choice;
+    // Fallback module for resolveProcsChained(): verified System32 module when verified,
+    // otherwise the held handle, and nullptr if that would point back at selfModule.
+    HMODULE fallbackModule = nullptr;
+    FARPROC createDevice = nullptr;
+    FARPROC createDeviceAndSwapChain = nullptr;
+    bool createDeviceFromVerified = false;
+    bool createDeviceAndSwapChainFromVerified = false;
+    bool missingCreateDevice = false;
+    bool missingCreateDeviceAndSwapChain = false;
+};
+
+inline SystemD3D11Exports resolveSystemD3D11ExportsFrom(
+    const SystemD3D11Choice& choice, HMODULE selfModule,
+    FARPROC fallbackCreateDevice, FARPROC fallbackCreateDeviceAndSwapChain) {
+    SystemD3D11Exports out;
+    out.choice = choice;
+    out.fallbackModule = (out.choice.module && out.choice.module != selfModule)
+                             ? out.choice.module
+                             : nullptr;
+    out.createDevice = fallbackCreateDevice;
+    out.createDeviceAndSwapChain = fallbackCreateDeviceAndSwapChain;
+    if (!out.choice.verified || !out.choice.module) return out;
+
+    if (FARPROC p = GetProcAddress(out.choice.module, "D3D11CreateDevice")) {
+        out.createDevice = p;
+        out.createDeviceFromVerified = true;
+    } else {
+        out.missingCreateDevice = true;
+    }
+    if (FARPROC p = GetProcAddress(out.choice.module, "D3D11CreateDeviceAndSwapChain")) {
+        out.createDeviceAndSwapChain = p;
+        out.createDeviceAndSwapChainFromVerified = true;
+    } else {
+        out.missingCreateDeviceAndSwapChain = true;
+    }
+    return out;
+}
+
+// Resolves D3D11CreateDevice* and the chained-export fallback from the module
+// chooseSystemD3D11(held) verifies. Never loads; if the verified module is
+// unavailable or lacks an export, preserves the caller's existing fallback proc.
+inline SystemD3D11Exports resolveSystemD3D11Exports(
+    HMODULE held, HMODULE selfModule,
+    FARPROC fallbackCreateDevice, FARPROC fallbackCreateDeviceAndSwapChain) {
+    return resolveSystemD3D11ExportsFrom(
+        chooseSystemD3D11(held), selfModule,
+        fallbackCreateDevice, fallbackCreateDeviceAndSwapChain);
+}
+
+// Picks the device-creation proc for an exported D3D11CreateDevice* entry point (#255):
+// - re-entrant calls from a chained proxy MUST use a verified System32 proc to break
+//   recursion; if none could be verified, return nullptr so the caller fails cleanly
+//   instead of recursing back into an unverified loader-phase proxy handle;
+// - outermost calls use realProc (chained proxy or loader-phase handle) when present, falling
+//   back to verifiedSystemProc if the loader-phase handle lacked the export.
+inline FARPROC selectCreateDeviceProc(bool reentrant, FARPROC realProc,
+                                      FARPROC verifiedSystemProc) noexcept {
+    if (reentrant) return verifiedSystemProc;
+    return realProc ? realProc : verifiedSystemProc;
+}
+
+// Refreshes a forwarding export table once System32's d3d11.dll becomes mapped (#255):
+// resolves each export from `preferred` first, falling back to `fallback`, then
+// `unresolvedStub`, and updates `procs[i]` via InterlockedExchangePointer only when the
+// resolved address changed. Returns the count of slots still pointing at `unresolvedStub`;
+// optional `updatedOut` counts slots whose target changed.
+inline size_t refreshChainedExports(HMODULE preferred, HMODULE fallback,
+                                    const char* const* names, size_t count, void** procs,
+                                    void* unresolvedStub, size_t* updatedOut = nullptr) {
+    size_t missing = 0;
+    size_t updated = 0;
+    for (size_t i = 0; i < count; ++i) {
+        void* p = preferred ? reinterpret_cast<void*>(GetProcAddress(preferred, names[i])) : nullptr;
+        if (!p && fallback) {
+            p = reinterpret_cast<void*>(GetProcAddress(fallback, names[i]));
+        }
+        if (!p) {
+            p = unresolvedStub;
+            ++missing;
+        }
+        if (procs[i] != p) {
+            InterlockedExchangePointer(&procs[i], p);
+            ++updated;
+        }
+    }
+    if (updatedOut) *updatedOut = updated;
+    return missing;
 }
 
 // For a rig that means to run on Windows' own d3d11 (every rig that only needs
