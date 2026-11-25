@@ -221,10 +221,59 @@ inline int flatReplayQueryRejectTests() {
         clean.begin(&a, T::Kind::Count); clean.end(&a, T::Kind::Count); clean.begin(&b, T::Kind::Timing); clean.end(&b, T::Kind::Timing);
         expect(clean.safe() && clean.begins == 2 && clean.ends == 2 && clean.firstCause == T::Cause::None, "paired brackets leave the tracker certain and counted");
 
+        // Issue #177: Count brackets spanning a VR <-> flat switch when flat is in scope (InstallScope::Both).
+        // Comparing the continuous scope gate (runtimeScopeIncludesFlat) against the old flat-only gate (runtimeFlatProfile):
+        {
+            auto driveBegin = [](T& scoped, T& flatOnly, bool scopeIncludesFlat, bool flatActive, const void* id, T::Kind k) {
+                if (scopeIncludesFlat) scoped.begin(id, k);
+                if (flatActive) flatOnly.begin(id, k);
+            };
+            auto driveEnd = [](T& scoped, T& flatOnly, bool scopeIncludesFlat, bool flatActive, const void* id, T::Kind k) {
+                if (scopeIncludesFlat) scoped.end(id, k);
+                if (flatActive) flatOnly.end(id, k);
+            };
+            // VR -> flat with an open Count bracket: tracked across the switch so flat knows it is open, then closes cleanly.
+            T scoped, flatOnly;
+            driveBegin(scoped, flatOnly, true, false, &a, T::Kind::Count);
+            expect(!scoped.safe() && !scoped.uncertain && scoped.openCount() == 1,
+                   "VR->flat Count bracket: scope-gated tracker knows the query is open upon entering flat");
+            expect(flatOnly.safe() && flatOnly.openCount() == 0,
+                   "VR->flat Count bracket control: flat-only tracker misses the VR Begin");
+            driveEnd(scoped, flatOnly, true, true, &a, T::Kind::Count);
+            expect(scoped.safe() && !scoped.uncertain && scoped.openCount() == 0,
+                   "VR->flat Count bracket: End in flat closes cleanly without setting uncertain");
+            expect(flatOnly.uncertain && flatOnly.firstCause == T::Cause::UnmatchedEnd && flatOnly.firstCauseKind == T::Kind::Count,
+                   "VR->flat Count bracket control: flat-only tracker hits unmatched-end count escape");
+
+            // Flat -> VR -> flat with a Count bracket closing in VR: End in VR clears the slot cleanly.
+            T scoped2, flatOnly2;
+            driveBegin(scoped2, flatOnly2, true, true, &a, T::Kind::Count);
+            driveEnd(scoped2, flatOnly2, true, false, &a, T::Kind::Count);
+            expect(scoped2.safe() && !scoped2.uncertain && scoped2.openCount() == 0,
+                   "flat->VR->flat Count bracket: End in VR clears the open entry before returning to flat");
+            expect(!flatOnly2.safe() && flatOnly2.openCount() == 1,
+                   "flat->VR->flat Count bracket control: flat-only tracker leaks the open Count entry forever");
+            driveBegin(scoped2, flatOnly2, true, true, &a, T::Kind::Count);
+            driveEnd(scoped2, flatOnly2, true, true, &a, T::Kind::Count);
+            expect(scoped2.safe() && !scoped2.uncertain && scoped2.openCount() == 0,
+                   "flat->VR->flat Count bracket: subsequent flat Begin/End on the same query succeeds");
+            expect(flatOnly2.uncertain && flatOnly2.firstCause == T::Cause::DuplicateBegin,
+                   "flat->VR->flat Count bracket control: flat-only tracker hits duplicate-begin on reuse");
+
+            // Flat -> VR -> flat with a Count bracket staying open across both switches.
+            T scoped3;
+            scoped3.begin(&a, T::Kind::Count);  // flat
+            expect(!scoped3.safe() && !scoped3.uncertain && scoped3.openCount() == 1,
+                   "flat->VR->flat open Count bracket remains tracked across both switches");
+            scoped3.end(&a, T::Kind::Count);    // flat again
+            expect(scoped3.safe() && !scoped3.uncertain && scoped3.openCount() == 0,
+                   "flat->VR->flat open Count bracket closes cleanly on return to flat");
+        }
+
         char text[1000];
         flatQueryTrackerFormatStart(text, sizeof(text), "End", 0x00000208662D5580ull, 4321);
         expect(std::strcmp(text, "flat replay query tracker: observing from here (first call End on context 00000208662D5580, thread 4321); calls before this were not observed "
-                                 "(the observer runs only in the flat profile), so a bracket opened earlier ends here without a Begin") == 0,
+                                 "(the observer runs while flat is in scope), so a bracket opened earlier ends here without a Begin") == 0,
                "the start line, character for character");
         flatQueryTrackerFormatEscape(text, sizeof(text), 5, "End", 5, 2, 4321, 0x00000208662D5580ull, 0, 1, 0, 3);
         expect(std::strcmp(text, "flat replay query tracker: first escape: cause=unmatched-end call=End query=OCCLUSION_PREDICATE#5 kind=count thread=4321 "
@@ -260,9 +309,23 @@ inline int flatReplayQueryRejectTests() {
         };
         const std::string runtimeCpp = slurp("src/d3d11/flat_runtime.cpp");
         const std::string rejectH = slurp("src/d3d11/flat_replay_query_reject.h");
-        expect(!runtimeCpp.empty() && !rejectH.empty(), "the runtime and the instrument header are readable from the repo root");
+        const std::string vscreenCpp = slurp("src/d3d11/vscreen.cpp");
+        expect(!runtimeCpp.empty() && !rejectH.empty() && !vscreenCpp.empty(),
+               "the runtime, instrument header, and vscreen hook are readable from the repo root");
         struct Pin { const std::string* text; const char* needle; unsigned times; const char* what; };
         const Pin pins[] = {
+            {&vscreenCpp, "if (runtimeScopeIncludesFlat() && !foreignContext(self)) flatRuntimeReplayQueryBegin(self, async);", 1,
+             "hookedBegin forwards owner-context queries to the replay tracker whenever flat is in scope (#177)"},
+            {&vscreenCpp, "if (runtimeScopeIncludesFlat() && !foreignContext(self)) flatRuntimeReplayQueryEnd(self, async);", 2,
+             "hookedEnd forwards owner-context queries to the replay tracker on both return paths whenever flat is in scope (#177)"},
+            {&runtimeCpp, "return entry && entry->tracker.safe();", 1,
+             "replayQueriesSafe isolates a tracked context's safety decision from global foreign-context table overflow (#177)"},
+            {&runtimeCpp, "if(!queries || !queries->tracker.safe())", 1,
+             "overlay replay query gate isolates a tracked context from global table overflow (#177)"},
+            {&runtimeCpp, "if (kind == FlatReplayQueryTracker::Kind::EndOnly && !runtimeFlatProfile()) return;", 1,
+             "flatRuntimeReplayQueryEnd skips the observer lock for EndOnly queries while VR is active (#177)"},
+            {&runtimeCpp, "if(!observer.started) {\n        observer.started=true;observer.firstTick=now;", 1,
+             "replayQueryTakeNote starts observer.firstTick on the first observed call regardless of active profile (#177)"},
             {&runtimeCpp, "const bool queriesChecked=opaque && bytes;", 1, "the safety test is reached under the same condition it always was (opaque and the original bytes)"},
             {&runtimeCpp, "const bool queriesUnsafe=queriesChecked && !replayQueriesSafe(ctx);", 1,
              "the rejection decision is the old expression: opaque && bytes && !replayQueriesSafe(ctx)"},
@@ -300,6 +363,11 @@ inline int flatReplayQueryRejectTests() {
             for (size_t at = without.find(pin.needle); at != std::string::npos; at = without.find(pin.needle)) without.erase(at, std::strlen(pin.needle));
             expect(count(without, pin.needle) == 0, "replay query reject wiring control: a source with the line removed no longer contains it");
         }
+        expect(count(vscreenCpp, "runtimeFlatProfile())flatRuntimeReplayQueryBegin") == 0 &&
+               count(vscreenCpp, "runtimeFlatProfile()) flatRuntimeReplayQueryBegin") == 0 &&
+               count(vscreenCpp, "runtimeFlatProfile())flatRuntimeReplayQueryEnd") == 0 &&
+               count(vscreenCpp, "runtimeFlatProfile()) flatRuntimeReplayQueryEnd") == 0,
+               "hookedBegin/hookedEnd no longer gate replay query tracking on runtimeFlatProfile() alone (#177)");
         const size_t check = runtimeCpp.find("const bool queriesChecked=opaque && bytes;");
         const size_t unplannable = runtimeCpp.find("const bool unplannable=!opaque || !bytes || queriesUnsafe || indirectArgs;", check);
         const size_t note = runtimeCpp.find("noteReplayQueryCheck(s,ctx,queriesUnsafe,", check);

@@ -1515,7 +1515,7 @@ bool replayQueriesSafe(ID3D11DeviceContext* ctx) {
     if(!ctx || ctx->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return false;
     auto& observer=replayQueryObserver();std::lock_guard<std::mutex> lock(observer.mutex);
     auto* entry=observer.find(ctx);
-    return !observer.overflow && entry && entry->tracker.safe();
+    return entry && entry->tracker.safe();
 }
 FlatReplayQueryTracker::Kind replayQueryKind(ID3D11Asynchronous* async) {
     if (!async) return FlatReplayQueryTracker::Kind::Unknown;
@@ -1555,8 +1555,7 @@ FlatQueryReject replayQueryRejection(ID3D11DeviceContext* ctx) {
     if(!ctx || ctx->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE) { add(kFlatQueryNotImmediate);return r; }
     auto& observer=replayQueryObserver();std::lock_guard<std::mutex> lock(observer.mutex);
     auto* entry=observer.find(ctx);
-    if(observer.overflow || !entry)add(kFlatQueryTableFull);
-    if(!entry) return r;
+    if(!entry) { add(kFlatQueryTableFull); return r; }
     if(entry->tracker.uncertain)add(kFlatQueryUncertain);
     for(size_t i=0;i<64;++i) {
         const auto& active=entry->tracker.active[i];
@@ -5783,6 +5782,8 @@ void flatRuntimeReplayQueryBegin(ID3D11DeviceContext* ctx, ID3D11Asynchronous* a
 void flatRuntimeReplayQueryEnd(ID3D11DeviceContext* ctx, ID3D11Asynchronous* async) {
     if (ctx && ctx->GetType()==D3D11_DEVICE_CONTEXT_IMMEDIATE) {
         const auto kind=replayQueryKind(async);
+        // EndOnly queries (EVENT, TIMESTAMP) never open a bracket; skip the observer lock while VR is active.
+        if (kind == FlatReplayQueryTracker::Kind::EndOnly && !runtimeFlatProfile()) return;
         ReplayQueryNote note;
         {
             auto& observer=replayQueryObserver();std::lock_guard<std::mutex> lock(observer.mutex);
@@ -8931,7 +8932,7 @@ void FlatRuntimeDrawScope::beginActualDraw(ID3D11Buffer* indirectArgs,UINT indir
                     auto& observer=replayQueryObserver();
                     std::unique_lock<std::mutex> queryGate(observer.mutex);
                     auto* queries=observer.find(ctx);
-                    if(observer.overflow || !queries || !queries->tracker.safe())
+                    if(!queries || !queries->tracker.safe())
                         replayWhy="replay-active-or-uncertain-query";
                     else {
                         overlayStarted=s.overlay.beginReplayDraw(ctx,s.prefix.frame,overlayHdr,overlayDsv,&replayWhy);

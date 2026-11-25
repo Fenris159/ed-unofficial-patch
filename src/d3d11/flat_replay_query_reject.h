@@ -123,7 +123,7 @@ inline const char* flatQueryKindName(uint32_t k) {
 inline int flatQueryTrackerFormatStart(char* out, size_t size, const char* call, unsigned long long context, uint32_t thread) {
     return std::snprintf(out, size,
         "flat replay query tracker: observing from here (first call %s on context %016llX, thread %u); calls before this were not observed "
-        "(the observer runs only in the flat profile), so a bracket opened earlier ends here without a Begin",
+        "(the observer runs while flat is in scope), so a bracket opened earlier ends here without a Begin",
         call ? call : "?", context, thread);
 }
 // The first time the tracker went uncertain: why, on which call and query, and what it had seen by then.
