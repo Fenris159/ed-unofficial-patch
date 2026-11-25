@@ -3584,6 +3584,37 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Issue #199: Log::addExitEmitter writes multi-line process-exit summaries alongside
+    // Log::setExitLine during Log::detachDuringProcessExit() without displacing setExitLine.
+    {
+        const std::wstring exitDir = widen(argv[2]) + L"_exitemit";
+        if (logcases::openSession(exitDir, L"exitemit", "max_mb = 0\r\n")) {
+            auto singleExit = [](char* out, size_t cap) -> int {
+                return std::snprintf(out, cap, "single exit line sentinel");
+            };
+            auto multiExit = [](edvr::Log::ExitWriteFn emit, void* ctx) {
+                const char* a = "emitter line one (F175)";
+                const char* b = "emitter line two (F175)";
+                emit(a, std::strlen(a), ctx);
+                emit(b, std::strlen(b), ctx);
+            };
+            edvr::Log::get().setExitLine(singleExit);
+            edvr::Log::get().addExitEmitter(multiExit);
+            edvr::Log::get().addExitEmitter(multiExit);   // idempotent deduplication
+            edvr::Log::get().detachDuringProcessExit();
+            const std::wstring head = logcases::headOf(exitDir, L"exitemit");
+            const std::string text = head.empty() ? std::string() : logcases::slurp(exitDir + L"\\" + head);
+            check(!head.empty() &&
+                      logcases::count(text, "single exit line sentinel") == 1 &&
+                      logcases::count(text, "emitter line one (F175)") == 1 &&
+                      logcases::count(text, "emitter line two (F175)") == 1,
+                  "#199: Log::addExitEmitter writes alongside setExitLine on detachDuringProcessExit and deduplicates");
+            edvr::Log::get().setExitLine(nullptr);
+        } else {
+            fail("exit emitter log open", "could not open scratch log session");
+        }
+    }
+
     if (g_fails) {
         printf("CONFIG TEST FAILED (%d)\n", g_fails);
         return 1;

@@ -780,6 +780,15 @@ void Log::noteReserved(const char* fmt, ...) {
     if (n > 0) append(line, static_cast<size_t>(n), true, m_maxBytes ? logKindHash(fmt, line, static_cast<size_t>(n)) : 0);
 }
 
+void Log::addExitEmitter(ExitEmitterFn fn) {
+    if (!fn) return;
+    for (size_t i = 0; i < kMaxExitEmitters; ++i) {
+        ExitEmitterFn cur = m_exitEmitters[i].load(std::memory_order_acquire);
+        if (cur == fn) return;
+        if (cur == nullptr && m_exitEmitters[i].compare_exchange_strong(cur, fn, std::memory_order_acq_rel)) return;
+    }
+}
+
 void Log::detachDuringProcessExit() {
     if (!m_open || !m_impl) return;
 
@@ -835,6 +844,29 @@ void Log::detachDuringProcessExit() {
                     DWORD w = 0;
                     WriteFile(out, msg, static_cast<DWORD>(n), &w, nullptr);
                 }
+            }
+        }
+        // Additional process-exit summary emitters (addExitEmitter): direct WriteFile, stack buffer only.
+        auto emitExit = [](const char* text, size_t len, void* ctx) {
+            if (!text || !len) return;
+            const HANDLE h = static_cast<HANDLE>(ctx);
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            char buf[1280];
+            int n = _snprintf_s(buf, sizeof(buf), _TRUNCATE, "[%02u:%02u:%02u.%03u] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+            if (n <= 0) return;
+            const size_t avail = sizeof(buf) - static_cast<size_t>(n) - 2;
+            const size_t copy = len < avail ? len : avail;
+            std::memcpy(buf + n, text, copy);
+            n += static_cast<int>(copy);
+            buf[n++] = '\r';
+            buf[n++] = '\n';
+            DWORD w = 0;
+            WriteFile(h, buf, static_cast<DWORD>(n), &w, nullptr);
+        };
+        for (size_t i = 0; i < kMaxExitEmitters; ++i) {
+            if (const ExitEmitterFn fn = m_exitEmitters[i].load(std::memory_order_acquire)) {
+                fn(emitExit, static_cast<void*>(out));
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {

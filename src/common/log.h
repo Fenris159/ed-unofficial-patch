@@ -47,6 +47,15 @@ public:
     using ExitLineFn = int (*)(char* out, size_t cap);
     void setExitLine(ExitLineFn fn) { m_exitLine.store(fn, std::memory_order_release); }
 
+    // Multi-line exit emitter for modules whose final partial summary must survive normal process
+    // exit without displacing setExitLine (up to kMaxExitEmitters lock-free slots). `fn` runs in
+    // detachDuringProcessExit under the same rules: no locks, no heap, no note(); invoke `emit`
+    // once per line with a stack-formatted message.
+    using ExitWriteFn = void (*)(const char* text, size_t len, void* ctx);
+    using ExitEmitterFn = void (*)(ExitWriteFn emit, void* ctx);
+    static constexpr size_t kMaxExitEmitters = 4;
+    void addExitEmitter(ExitEmitterFn fn);
+
     void note(const char* fmt, ...);
 
     // A line that is also kept in the log's head once the head has ended (log.max_mb, log_rotate.h). Before that it is exactly
@@ -101,6 +110,7 @@ private:
     // read-modify-write FaultBudget's comment in guard.h already names.
     std::atomic<uint64_t> m_dropped{0};
     std::atomic<ExitLineFn> m_exitLine{nullptr};
+    std::atomic<ExitEmitterFn> m_exitEmitters[kMaxExitEmitters] = {};
     // Written by whichever thread is inside writeBuffer, which is the flusher
     // OR the one calling close() -- never both, because close() joins the
     // flusher first and the join is the happens-before edge. "One writer at a

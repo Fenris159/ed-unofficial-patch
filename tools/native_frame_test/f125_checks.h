@@ -16,6 +16,9 @@
 #include "../../src/d3d11/native_on_foot_f91.h"
 
 #include <cstdint>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace f125test {
@@ -461,6 +464,41 @@ inline void run125(Check&& check) {
         check(!context.take(), "F125 pin: the later clean B second starts a clean item window after the isolated mixed second");
         context.observe(30); context.observe(20);
         check(context.take() && !context.take(), "F125 pin: a context change and return inside one second is mixed once, never replayed without new samples");
+        // Issue #199: per-slot weapon weight polarity conflict/merge prevents F97 empty<->active transitions from fragmenting 10 s windows.
+        const uint32_t secStand = lp::weightSlotPolarity(90, 90.0) | (lp::weightSlotPolarity(90, 90.0) << 2);
+        const uint32_t secWalk = lp::weightSlotPolarity(90, 90.0) | (lp::weightSlotPolarity(90, 90.0) << 4);
+        const uint32_t secHolster = lp::weightSlotPolarity(90, 0.0) | (lp::weightSlotPolarity(90, 0.0) << 2);
+        check(!lp::weightPolarityConflict(secStand, secWalk, 5),
+              "F125 (#199): transitioning between F97 bins at steady weight does not split the 10 s pin window");
+        const uint32_t merged = lp::weightPolarityMerge(secStand, secWalk, 5);
+        check(merged == (secStand | secWalk) && lp::weightPolarityConflict(merged, secHolster, 5),
+              "F125 (#199): merged polarity tracks every seen bin and splits when weapon weight actually crosses 0.99");
+        // Source pins for #199's diet fixes in native_on_foot.cpp.
+        {
+            std::ifstream nf("src/d3d11/native_on_foot.cpp", std::ios::binary);
+            std::stringstream nss;
+            nss << nf.rdbuf();
+            const std::string src = nss.str();
+            const size_t f175FlushFn = src.find("void f175FlushPending(uint64_t now) noexcept {");
+            const size_t f175FlushCall = f175FlushFn == std::string::npos ? std::string::npos : src.find("nofoot::logwin::flush(g_f175LineMs, now)", f175FlushFn);
+            const size_t f175FlipPos = src.find("if (f61Flipped) {");
+            const size_t f175MergeTickPos = f175FlipPos == std::string::npos ? std::string::npos : src.find("if (haveTick) g_f175Acc.mergeSlice(vw, sliceMs);", f175FlipPos);
+            const size_t f175RearmPos = f175FlipPos == std::string::npos ? std::string::npos : src.find("g_f175LineMs = now;", f175FlipPos);
+            check(!src.empty() && src.find("if (sayPin && st.legSolves)") != std::string::npos &&
+                      src.find("if (sayPin && st.reachWant)") != std::string::npos &&
+                      src.find("lp::weightPolarityConflict(w.weightSig, weightSig, kWeightSlots)") != std::string::npos &&
+                      src.find("lineMs = binMs = g_f175LineMs = g_f175TakeMs = now;") != std::string::npos &&
+                      f175FlipPos != std::string::npos && f175RearmPos != std::string::npos && f175MergeTickPos != std::string::npos &&
+                      f175RearmPos < f175MergeTickPos &&
+                      src.find("nofoot::logwin::window(g_f175LineMs, now)") != std::string::npos &&
+                      src.find("f175FlushPending(now);") != std::string::npos &&
+                      f175FlushCall != std::string::npos &&
+                      src.find("fs.f61On = in.f61On;") != std::string::npos &&
+                      src.find("const uint32_t f85WindowSecs = nofoot::logwin::gateWindow(g_f85BlockMs, nowMs, f85Edge, oneSecond);") != std::string::npos &&
+                      src.find("void noteMaybeEdgeFlush(bool edgeFlush, const char* fmt, ...)") != std::string::npos &&
+                      src.find(" [edge flush]") != std::string::npos,
+                  "F125 (#199): F67c legs/reach are detail-gated, F94a/F95a/F97a use polarity conflict, F175 starts clock with lineMs + separates samples per-frame by F61 rig state + flushes/re-arms on flip, F85b uses g_f85BlockMs, and deliberate edge flushes carry [edge flush]");
+        }
     }
     lw::setDetail(was);
 }
