@@ -29,7 +29,9 @@
 #include <wrl/client.h>
 #include <xess/xess_d3d12.h>
 #include "gpu_timing.h"
+#include "d3d12_caps.h"
 #include "xess_feature_latch.h"
+#include "xess_log_callback.h"
 #include "xess_runtime_version.h"
 #include "temporal_shader_bytecode.h"
 using Microsoft::WRL::ComPtr;
@@ -74,7 +76,20 @@ struct XessApi {
     decltype(&xessD3D12Init) init = nullptr;
     decltype(&xessD3D12Execute) execute = nullptr;
     decltype(&xessDestroyContext) destroyContext = nullptr;
+    // Optional diagnostic exports (issue #256): never fail availability if omitted.
+    decltype(&xessSetLoggingCallback) setLoggingCallback = nullptr;
+    decltype(&xessIsOptimalDriver) isOptimalDriver = nullptr;
+    decltype(&xessGetProperties) getProperties = nullptr;
 };
+
+XessLogLimiter g_xessLogLimiter{40};
+
+void xessLogCallback(const char* message, xess_logging_level_t loggingLevel) {
+    const XessLogFormatResult res = g_xessLogLimiter.format(message, static_cast<int>(loggingLevel));
+    if (res.action != XessLogFormatResult::Action::Drop) {
+        Log::get().note("%s", res.line);
+    }
+}
 
 struct SharedTexture {
     ComPtr<ID3D11Texture2D> d11;
@@ -637,6 +652,26 @@ bool makeFeature(State& state, unsigned slot, uint32_t w, uint32_t h, uint32_t o
     if (created != XESS_RESULT_SUCCESS || !feature->context)
         return fail(why, "xessD3D12CreateContext returned %d", int(created));
     Log::get().note("xess: slot=%u D3D12 context create rc=%d ptr=%p", slot, int(created), feature->context);
+    if (state.api.setLoggingCallback) {
+        static_assert(static_cast<int>(XESS_LOGGING_LEVEL_DEBUG) == 0 &&
+                          static_cast<int>(XESS_LOGGING_LEVEL_INFO) == 1 &&
+                          static_cast<int>(XESS_LOGGING_LEVEL_WARNING) == 2 &&
+                          static_cast<int>(XESS_LOGGING_LEVEL_ERROR) == 3,
+                      "XessLogLimiter expects XeSS logging levels 0..3");
+        const xess_result_t logRc = state.api.setLoggingCallback(
+            feature->context, XESS_LOGGING_LEVEL_INFO, &xessLogCallback);
+        if (logRc != XESS_RESULT_SUCCESS) {
+            Log::get().note("xess: slot=%u xessSetLoggingCallback(INFO) rc=%d", slot, int(logRc));
+        }
+    }
+    if (state.api.isOptimalDriver) {
+        // Query before xessD3D12Init so old-driver init failures still report driver status.
+        const xess_result_t optRc = state.api.isOptimalDriver(feature->context);
+        Log::get().note("xess: slot=%u optimalDriver rc=%d (%s)", slot, int(optRc),
+                        optRc == XESS_RESULT_SUCCESS ? "optimal"
+                        : optRc == XESS_RESULT_WARNING_OLD_DRIVER ? "old driver"
+                                                                  : "other");
+    }
     // From this point every failure destroys the XeSS context before the
     // temporary shared textures and D3D12 objects leave scope.
     auto abandon = [&]() -> bool {
@@ -660,6 +695,19 @@ bool makeFeature(State& state, unsigned slot, uint32_t w, uint32_t h, uint32_t o
     }
     Log::get().note("xess: slot=%u D3D12 init rc=%d flags=0x%X quality=%u output=%ux%u",
                     slot, int(initialized), init.initFlags, unsigned(feature->quality), outW, outH);
+    if (state.api.setLoggingCallback) {
+        // After startup capture, raise to WARNING so steady-state execution only logs warnings/errors.
+        (void)state.api.setLoggingCallback(feature->context, XESS_LOGGING_LEVEL_WARNING, &xessLogCallback);
+    }
+    if (state.api.getProperties) {
+        const xess_2d_t outRes{outW, outH};
+        xess_properties_t props{};
+        const xess_result_t propRc = state.api.getProperties(feature->context, &outRes, &props);
+        Log::get().note("xess: slot=%u properties rc=%d descriptors=%u tempBuf=%llu tempTex=%llu",
+                        slot, int(propRc), unsigned(props.requiredDescriptorCount),
+                        static_cast<unsigned long long>(props.tempBufferHeapSize),
+                        static_cast<unsigned long long>(props.tempTextureHeapSize));
+    }
     xess_version_t intel{};
     const xess_result_t intelRc = state.api.getIntelVersion(feature->context, &intel);
     Log::get().note("xess: slot=%u Intel XeFX query rc=%d version=%u.%u.%u.%u (diagnostic only)",
@@ -828,6 +876,7 @@ bool xessAvailable(ID3D11Device* device, const char** why) {
     Log::get().note("xess: D3D11/D3D12 adapter matched LUID=%08X:%08X vendor=0x%04X device=0x%04X",
                     unsigned(desc.AdapterLuid.HighPart), unsigned(desc.AdapterLuid.LowPart),
                     desc.VendorId, desc.DeviceId);
+    Log::get().note("xess: d3d12 caps: %s", formatD3D12Caps(queryD3D12Caps(state->d12.Get())).c_str());
     // Resolve from this module, not the process working directory or an
     // already-loaded foreign copy. The rig resolves beside its executable.
     HMODULE self = nullptr;
@@ -878,6 +927,10 @@ bool xessAvailable(ID3D11Device* device, const char** why) {
         !loadProc(state->xessModule, "xessD3D12Execute", api.execute) ||
         !loadProc(state->xessModule, "xessDestroyContext", api.destroyContext))
         return fail(why, "libxess.dll lacks a required XeSS-SR D3D12 export");
+    // Optional diagnostic exports (issue #256): resolve best-effort so swapped DLLs keep working.
+    loadProc(state->xessModule, "xessSetLoggingCallback", api.setLoggingCallback);
+    loadProc(state->xessModule, "xessIsOptimalDriver", api.isOptimalDriver);
+    loadProc(state->xessModule, "xessGetProperties", api.getProperties);
     xess_version_t version{};
     const xess_result_t versionRc = api.getVersion(&version);
     if (versionRc != XESS_RESULT_SUCCESS)
@@ -1303,6 +1356,7 @@ void xessShutdown() {
         g_state = nullptr;
     }
     forgetFailedProbeDevice();
+    g_xessLogLimiter.reset();
     g_tried = false;
     g_available = false;
 #endif
