@@ -3958,9 +3958,8 @@ void logAliasOutcome(const char* prefix) {
     const State& s = g_s;
     const char* file = aliasFileName();
     if (s.aliasSource == 2) {
-        Log::get().note("menu keys: %sno bindings files were found under Options\\Bindings, so the "
-                        "menu's own keys only. (A stock control scheme keeps its file in the "
-                        "game's ControlSchemes folder, which this build does not read yet.)",
+        Log::get().note("menu keys: %sno bindings files were found under Options\\Bindings or "
+                        "ControlSchemes, so the menu's own keys only.",
                         prefix);
         return;
     }
@@ -5197,8 +5196,8 @@ void menuAdoptGameBindings(bool enabled, const char* why) {
         return;
     }
     for (int i = 0; i < kMenuUiElementCount; ++i) {
-        eliteBindsLookupSlots(kMenuUiElements[i].element, kEliteKeyAllowModifierMain,
-                              &s.aliasSlots[i]);
+        eliteBindsLookupSlotsContext(EliteBindContext::General, kMenuUiElements[i].element,
+                                     kEliteKeyAllowModifierMain, &s.aliasSlots[i]);
     }
     const bool changed = resolveAliases();
     if (!why) {

@@ -2182,12 +2182,12 @@ void readoptGameBindings() {
         char fb[48];
         const auto enterBefore = g_state->fssEnterKey.key();
         const auto quitBefore = g_state->fssQuitKey.key();
-        if (eliteBindsLookup("ExplorationFSSEnter", fb, sizeof(fb))) {
+        if (eliteBindsLookupContext(EliteBindContext::Ship, "ExplorationFSSEnter", fb, sizeof(fb))) {
             g_state->fssEnterKey.setBinding(fb);
         } else {
             g_state->fssEnterKey.setBinding("");
         }
-        if (eliteBindsLookup("ExplorationFSSQuit", fb, sizeof(fb))) {
+        if (eliteBindsLookupContext(EliteBindContext::Ship, "ExplorationFSSQuit", fb, sizeof(fb))) {
             g_state->fssQuitKey.setBinding(fb);
         } else {
             g_state->fssQuitKey.setBinding("");
@@ -2199,11 +2199,11 @@ void readoptGameBindings() {
                             "enter and quit keys were re-read.");
         }
         g_state->fssEnterPad = XinputBinding{};
-        if (eliteBindsLookupPad("ExplorationFSSEnter", fb, sizeof(fb))) {
+        if (eliteBindsLookupPadContext(EliteBindContext::Ship, "ExplorationFSSEnter", fb, sizeof(fb))) {
             xinputTranslate(fb, &g_state->fssEnterPad);
         }
         g_state->fssQuitPad = XinputBinding{};
-        if (eliteBindsLookupPad("ExplorationFSSQuit", fb, sizeof(fb))) {
+        if (eliteBindsLookupPadContext(EliteBindContext::Ship, "ExplorationFSSQuit", fb, sizeof(fb))) {
             xinputTranslate(fb, &g_state->fssQuitPad);
         }
     }
@@ -2398,12 +2398,12 @@ State& ensureState() {
         g_state->fssQuitKey.setGameMirrored(true);
         if (Config::get().getBool("hotkey.read_game_bindings", true)) {
             char b[48];
-            if (eliteBindsLookup("ExplorationFSSEnter", b, sizeof(b))) {
+            if (eliteBindsLookupContext(EliteBindContext::Ship, "ExplorationFSSEnter", b, sizeof(b))) {
                 g_state->fssEnterKey.setBinding(b);
                 Log::get().note("hotkey: the FSS enter key adopted from "
                                 "your Elite bindings: %s", b);
             }
-            if (eliteBindsLookup("ExplorationFSSQuit", b, sizeof(b))) {
+            if (eliteBindsLookupContext(EliteBindContext::Ship, "ExplorationFSSQuit", b, sizeof(b))) {
                 g_state->fssQuitKey.setBinding(b);
                 Log::get().note("hotkey: the FSS quit key adopted from "
                                 "your Elite bindings: %s", b);
@@ -2411,15 +2411,15 @@ State& ensureState() {
             {
                 char pk[40];
                 g_state->fssEnterPad = XinputBinding{};
-                if (eliteBindsLookupPad("ExplorationFSSEnter", pk,
-                                        sizeof(pk)) &&
+                if (eliteBindsLookupPadContext(EliteBindContext::Ship, "ExplorationFSSEnter", pk,
+                                               sizeof(pk)) &&
                     xinputTranslate(pk, &g_state->fssEnterPad)) {
                     Log::get().note("hotkey: the FSS enter key is also on "
                                     "your gamepad: %s.", pk);
                 }
                 g_state->fssQuitPad = XinputBinding{};
-                if (eliteBindsLookupPad("ExplorationFSSQuit", pk,
-                                        sizeof(pk)) &&
+                if (eliteBindsLookupPadContext(EliteBindContext::Ship, "ExplorationFSSQuit", pk,
+                                               sizeof(pk)) &&
                     xinputTranslate(pk, &g_state->fssQuitPad)) {
                     Log::get().note("hotkey: the FSS quit key is also on "
                                     "your gamepad: %s.", pk);

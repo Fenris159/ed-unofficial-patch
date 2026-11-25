@@ -1715,7 +1715,122 @@ void testEliteBinds(const char* root) {
     }
     check(kn == 3 && sawSpace && sawCtrlR && !leaked, "eliteBindsKeyboardUses still answers keyboard bindings only");
 
-    // The same walk over the real file, when this machine has one (Sean's rig does).
+    // Helper: concatenate all active preset .binds files in `bindsDir` (matching StartPreset.4.start
+    // or StartPreset.start, or every .binds if the start file is empty) so multi-preset installs where
+    // eliteBindsAllUsesDir reports "Primary.4.2.binds (+N more)" verify against the actual files (#182).
+    auto readActiveBindsText = [](const std::wstring& bindsDir) -> std::string {
+        auto readAll = [](const std::wstring& path) -> std::string {
+            std::string out;
+            HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (f == INVALID_HANDLE_VALUE) return out;
+            const DWORD size = GetFileSize(f, nullptr);
+            if (size != INVALID_FILE_SIZE && size > 0) {
+                out.resize(size);
+                DWORD got = 0;
+                if (ReadFile(f, &out[0], size, &got, nullptr)) out.resize(got);
+                else out.clear();
+            }
+            CloseHandle(f);
+            return out;
+        };
+        std::string presets = readAll(bindsDir + L"\\StartPreset.4.start");
+        if (presets.empty()) presets = readAll(bindsDir + L"\\StartPreset.start");
+        if (presets.size() >= 3 && static_cast<unsigned char>(presets[0]) == 0xEF &&
+            static_cast<unsigned char>(presets[1]) == 0xBB &&
+            static_cast<unsigned char>(presets[2]) == 0xBF) {
+            presets.erase(0, 3);
+        }
+        std::vector<std::string> names;
+        size_t pos = 0;
+        while (pos < presets.size()) {
+            size_t eol = presets.find_first_of("\r\n", pos);
+            std::string line = eol == std::string::npos ? presets.substr(pos) : presets.substr(pos, eol - pos);
+            while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) line.pop_back();
+            size_t lead = 0;
+            while (lead < line.size() && (line[lead] == ' ' || line[lead] == '\t')) ++lead;
+            if (lead) line.erase(0, lead);
+            if (!line.empty()) names.push_back(std::move(line));
+            if (eol == std::string::npos) break;
+            pos = eol + 1;
+            if (presets[eol] == '\r' && pos < presets.size() && presets[pos] == '\n') ++pos;
+        }
+        std::string combined;
+        WIN32_FIND_DATAW fd{};
+        HANDLE find = FindFirstFileW((bindsDir + L"\\*.binds").c_str(), &fd);
+        if (find == INVALID_HANDLE_VALUE) return combined;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            char utf8[MAX_PATH]{};
+            WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, utf8, sizeof(utf8), nullptr, nullptr);
+            auto matchesPreset = [](const char* fn, const std::string& preset) -> bool {
+                if (!fn || preset.empty()) return false;
+                if (_strnicmp(fn, preset.c_str(), preset.size()) != 0 || fn[preset.size()] != '.') return false;
+                const char* p = fn + preset.size() + 1;
+                if (_stricmp(p, "binds") == 0) return true;
+                bool sawVer = false;
+                while (*p) {
+                    if (_stricmp(p, "binds") == 0) return sawVer;
+                    const char* dot = std::strchr(p, '.');
+                    if (!dot || dot == p) return false;
+                    for (const char* q = p; q < dot; ++q) {
+                        if (*q < '0' || *q > '9') return false;
+                    }
+                    sawVer = true;
+                    p = dot + 1;
+                }
+                return false;
+            };
+            bool active = names.empty();
+            for (const std::string& n : names) {
+                if (matchesPreset(utf8, n)) {
+                    active = true;
+                    break;
+                }
+            }
+            if (!active) continue;
+            combined += readAll(bindsDir + L"\\" + fd.cFileName);
+            combined += '\n';
+        } while (FindNextFileW(find, &fd));
+        FindClose(find);
+        return combined;
+    };
+
+    // Multi-preset synthetic check (#182): when two presets contribute, realFile carries "(+1 more)"
+    // and joystick device-id verification must inspect the contributing preset files, not open the label.
+    {
+        const std::wstring multiDir = dir + L"_multi";
+        CreateDirectoryW(multiDir.c_str(), nullptr);
+        writeFile(multiDir + L"\\StartPreset.4.start", "KeyPreset\r\nStickPreset\r\nKeyPreset\r\nKeyPreset\r\n");
+        writeFile(multiDir + L"\\KeyPreset.4.2.binds",
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<Root PresetName=\"KeyPreset\" MajorVersion=\"4\" MinorVersion=\"2\">\n"
+                  "  <HMDReset><Primary Device=\"Keyboard\" Key=\"Key_F12\" /></HMDReset>\n"
+                  "</Root>\n");
+        writeFile(multiDir + L"\\StickPreset.4.2.binds",
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<Root PresetName=\"StickPreset\" MajorVersion=\"4\" MinorVersion=\"2\">\n"
+                  "  <PrimaryFire><Primary Device=\"231D0200\" Key=\"Joy_1\" /></PrimaryFire>\n"
+                  "</Root>\n");
+        static EliteBindUse multiUses[32];
+        char multiFile[64] = "";
+        const int mn = eliteBindsAllUsesDir(multiDir.c_str(), multiUses, 32, multiFile, sizeof(multiFile));
+        const std::string multiText = readActiveBindsText(multiDir);
+        int multiSticks = 0, multiUnmatched = 0;
+        for (int i = 0; i < mn; ++i) {
+            if (multiUses[i].binding.kind != HotkeyKind::Joy) continue;
+            ++multiSticks;
+            char dev[9];
+            hotkeyJoyDeviceText(multiUses[i].binding.joyDevice, dev);
+            if (multiText.find(std::string("Device=\"") + dev + "\"") == std::string::npos) ++multiUnmatched;
+        }
+        check(mn == 2 && strstr(multiFile, "(+1 more)") != nullptr && multiSticks == 1 && !multiText.empty() && multiUnmatched == 0,
+              "#182: multi-preset '(+1 more)' display label verifies joystick device ids against the active .binds files");
+        DeleteFileW((multiDir + L"\\StartPreset.4.start").c_str());
+        DeleteFileW((multiDir + L"\\KeyPreset.4.2.binds").c_str());
+        DeleteFileW((multiDir + L"\\StickPreset.4.2.binds").c_str());
+        RemoveDirectoryW(multiDir.c_str());
+    }
+
+    // The same walk over the real file(s), when this machine has one (Sean's rig does).
     wchar_t local[MAX_PATH];
     if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH)) {
         const std::wstring real = std::wstring(local) + L"\\Frontier Developments\\Elite Dangerous\\Options\\Bindings";
@@ -1731,20 +1846,10 @@ void testEliteBinds(const char* root) {
             }
             printf("    (this machine's %s: %d uses, %d keyboard, %d pad, %d joystick)\n", realFile, rn, keys, pads, sticks);
             check(rn != 0 || strcmp(realFile, "") == 0, "the real bindings file parses");
-            // The device ids this build writes are the ones the file itself spells: each joystick
-            // use, formatted, is a Device="..." that is in the file's text.
+            // The device ids this build writes are the ones the active preset file(s) spell: each
+            // joystick use, formatted, is a Device="..." in the contributing .binds text (#182).
             if (sticks > 0) {
-                std::string text;
-                const std::wstring path = real + L"\\" + std::wstring(realFile, realFile + strlen(realFile));
-                HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                                       FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (f != INVALID_HANDLE_VALUE) {
-                    const DWORD size = GetFileSize(f, nullptr);
-                    text.resize(size);
-                    DWORD got = 0;
-                    ReadFile(f, &text[0], size, &got, nullptr);
-                    CloseHandle(f);
-                }
+                const std::string text = readActiveBindsText(real);
                 int unmatched = 0;
                 for (int i = 0; i < rn; ++i) {
                     if (realUses[i].binding.kind != HotkeyKind::Joy) continue;

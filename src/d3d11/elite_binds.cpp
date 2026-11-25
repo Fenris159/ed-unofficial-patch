@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "../common/hotkey.h"
@@ -87,6 +88,80 @@ std::wstring bindingsDir() {
            L"\\Frontier Developments\\Elite Dangerous\\Options\\Bindings";
 }
 
+std::wstring defaultGameDir() {
+    wchar_t exe[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);   // the game's exe: EDVR's d3d11.dll sits beside it
+    if (n == 0 || n >= MAX_PATH) return std::wstring();
+    std::wstring gameDir(exe);
+    const size_t slash = gameDir.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : gameDir.substr(0, slash);
+}
+
+bool isSafePresetName(const std::string& preset) {
+    if (preset.empty() || preset == "." || preset == "..") return false;
+    if (preset.find_first_of("\\/:") != std::string::npos) return false;
+    if (preset.find("..") != std::string::npos) return false;
+    return true;
+}
+
+void stripUtf8Bom(std::string* s) {
+    if (s && s->size() >= 3 &&
+        static_cast<unsigned char>((*s)[0]) == 0xEF &&
+        static_cast<unsigned char>((*s)[1]) == 0xBB &&
+        static_cast<unsigned char>((*s)[2]) == 0xBF) {
+        s->erase(0, 3);
+    }
+}
+
+std::string trimPresetLine(const std::string& raw) {
+    size_t b = 0;
+    size_t e = raw.size();
+    while (b < e && (raw[b] == ' ' || raw[b] == '\t' || raw[b] == '\r')) ++b;
+    while (e > b && (raw[e - 1] == ' ' || raw[e - 1] == '\t' || raw[e - 1] == '\r')) --e;
+    return raw.substr(b, e - b);
+}
+
+// Split StartPreset.4.start / StartPreset.start into lines, preserving blank lines
+// so line index stays aligned with Elite's bind context (0=General, 1=Ship, 2=SRV, 3=OnFoot),
+// without appending a phantom empty line after a trailing '\n'.
+std::vector<std::string> splitPresetLines(std::string presets) {
+    stripUtf8Bom(&presets);
+    std::vector<std::string> lines;
+    size_t start = 0;
+    while (start < presets.size()) {
+        size_t end = presets.find('\n', start);
+        if (end == std::string::npos) end = presets.size();
+        lines.push_back(trimPresetLine(presets.substr(start, end - start)));
+        start = end + 1;
+    }
+    return lines;
+}
+
+struct ResolvedBindsFile {
+    std::wstring path;
+    char label[MAX_PATH];
+};
+
+void appendUniquePresetName(std::vector<std::string>* out, const std::string& name) {
+    if (name.empty()) return;
+    for (const std::string& existing : *out) {
+        if (_stricmp(existing.c_str(), name.c_str()) == 0) return;
+    }
+    out->push_back(name);
+}
+
+void appendStockPresetCandidate(const wchar_t* gameDirC, const std::string& preset,
+                                std::vector<ResolvedBindsFile>* out) {
+    if (!gameDirC || !gameDirC[0] || !isSafePresetName(preset)) return;
+    wchar_t wname[MAX_PATH] = {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, preset.c_str(), -1, wname, MAX_PATH);
+    if (n <= 0) return;
+    ResolvedBindsFile f{};
+    f.path = std::wstring(gameDirC) + L"\\ControlSchemes\\" + wname + L".binds";
+    snprintf(f.label, sizeof(f.label), "ControlSchemes\\%s.binds", preset.c_str());
+    out->push_back(f);
+}
+
 bool readWholeFile(const std::wstring& path, std::string* out) {
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
@@ -148,6 +223,29 @@ struct Cand {
 // Returns false when there is no preset file or the directory cannot be
 // enumerated; true with an empty `out` is a preset naming files that are
 // not there.
+// Matches "<preset>.binds" or "<preset>.<digits>(.<digits>)*.binds" (case-insensitive).
+// Prevents preset "Pilot" from claiming another preset whose name begins with "Pilot."
+// such as "Pilot.SRV.4.2.binds" or "Pilot.backup.binds" (#182).
+bool bindsFileMatchesPreset(const char* filename, const std::string& preset) {
+    if (!filename || preset.empty()) return false;
+    if (_strnicmp(filename, preset.c_str(), preset.size()) != 0) return false;
+    if (filename[preset.size()] != '.') return false;
+    const char* p = filename + preset.size() + 1;
+    if (_stricmp(p, "binds") == 0) return true;
+    bool sawVersionSeg = false;
+    while (*p) {
+        if (_stricmp(p, "binds") == 0) return sawVersionSeg;
+        const char* dot = std::strchr(p, '.');
+        if (!dot || dot == p) return false;
+        for (const char* q = p; q < dot; ++q) {
+            if (*q < '0' || *q > '9') return false;
+        }
+        sawVersionSeg = true;
+        p = dot + 1;
+    }
+    return false;
+}
+
 // The same walk for an explicit list of preset names (the SRV lookup below passes the one name of its context); an empty list admits every .binds.
 bool collectBindsFilesFor(const std::wstring& dir, const std::vector<std::string>& names, std::vector<Cand>* out) {
     out->clear();
@@ -161,8 +259,7 @@ bool collectBindsFilesFor(const std::wstring& dir, const std::vector<std::string
                             sizeof(c.utf8), nullptr, nullptr);
         bool active = names.empty();
         for (const std::string& n : names) {
-            if (_strnicmp(c.utf8, n.c_str(), n.size()) == 0 &&
-                c.utf8[n.size()] == '.') {
+            if (bindsFileMatchesPreset(c.utf8, n)) {
                 active = true;
                 break;
             }
@@ -179,25 +276,146 @@ bool collectBindsFilesFor(const std::wstring& dir, const std::vector<std::string
     return true;
 }
 
-bool collectActiveBindsFiles(const std::wstring& dir, std::vector<Cand>* out) {
+// Resolve candidate .binds files for one Elite bind context (issue #182):
+// - If StartPreset.4.start has >= 4 lines and lines[ctx] is non-empty, ONLY that context's
+//   preset is searched: newest maintained files in Options\Bindings, then
+//   <gameDir>\ControlSchemes\<preset>.binds. Never falls through to another context's preset.
+// - Otherwise (old StartPreset.start, fewer than 4 lines, or blank line for this context),
+//   falls back to all unique active preset names in Options\Bindings newest-first, then
+//   <gameDir>\ControlSchemes\<name>.binds. An empty preset file admits every .binds in dir.
+// Returns false when no preset file exists at all.
+bool collectContextBindsFiles(const std::wstring& dir, const wchar_t* gameDirC,
+                              EliteBindContext ctx, std::vector<ResolvedBindsFile>* out) {
     out->clear();
+    if (dir.empty()) return false;
     std::string presets;
-    if (!readWholeFile(dir + L"\\StartPreset.4.start", &presets) &&
-        !readWholeFile(dir + L"\\StartPreset.start", &presets)) {
+    const bool hasV4 = readWholeFile(dir + L"\\StartPreset.4.start", &presets);
+    if (!hasV4 && !readWholeFile(dir + L"\\StartPreset.start", &presets)) {
         return false;
     }
+    const std::vector<std::string> lines = splitPresetLines(presets);
+    const size_t idx = static_cast<size_t>(ctx);
+    if (hasV4 && lines.size() >= 4 && idx < lines.size() && !lines[idx].empty()) {
+        const std::string& preset = lines[idx];
+        std::vector<Cand> cands;
+        std::vector<std::string> names(1, preset);
+        if (collectBindsFilesFor(dir, names, &cands)) {
+            for (const Cand& c : cands) {
+                ResolvedBindsFile f{};
+                f.path = dir + L"\\" + c.name;
+                snprintf(f.label, sizeof(f.label), "%s", c.utf8);
+                out->push_back(f);
+            }
+        }
+        appendStockPresetCandidate(gameDirC, preset, out);
+        return true;
+    }
     std::vector<std::string> names;
-    {
-        size_t start = 0;
-        while (start < presets.size()) {
-            size_t end = presets.find_first_of("\r\n", start);
-            if (end == std::string::npos) end = presets.size();
-            if (end > start) names.push_back(presets.substr(start, end - start));
-            start = presets.find_first_not_of("\r\n", end);
-            if (start == std::string::npos) break;
+    for (const std::string& l : lines) appendUniquePresetName(&names, l);
+    std::vector<Cand> cands;
+    if (collectBindsFilesFor(dir, names, &cands)) {
+        for (const Cand& c : cands) {
+            ResolvedBindsFile f{};
+            f.path = dir + L"\\" + c.name;
+            snprintf(f.label, sizeof(f.label), "%s", c.utf8);
+            out->push_back(f);
         }
     }
-    return collectBindsFilesFor(dir, names, out);
+    for (const std::string& n : names) appendStockPresetCandidate(gameDirC, n, out);
+    return true;
+}
+
+// Classify an Elite Dangerous XML action element into its StartPreset.4.start bind context
+// (0=General, 1=Ship, 2=SRV, 3=OnFoot), derived from Elite's ControlSchemes/*.binds schema:
+// - OnFoot: every element naming Humanoid (Humanoid*, *_Humanoid).
+// - SRV: every element naming Buggy (Buggy*, *_Buggy) plus the SRV-only controls without
+//   "Buggy" in their tag name.
+// - General: Interface Mode (UIFocus, UI_*, CycleNext/PreviousPanel/Page), Pause, FriendsMenu,
+//   HMDReset, MicrophoneMute, OpenCodexGoToDiscovery, ShowPGScoreSummaryInput, Headlook mode
+//   controls, Galaxy Map camera (Cam*, GalaxyMapHome), Camera Suite and free-camera controls
+//   (PhotoCameraToggle, ToggleVanityCamera, VanityCamera*, *FreeCam*, Pitch/Yaw/RollCamera*,
+//   ToggleRotationLock, FixCamera*, QuitCamera, ToggleAdvanceMode, FStop*, FocusDistance*),
+//   Holo-Me (CommanderCreator_*), Store camera (Store*), and Colonisation/Settlement placement.
+// - Ship: all remaining flight, ship-panel, targeting, weapon, fighter, multi-crew, FSS, and SAA controls.
+EliteBindContext eliteElementContext(const char* element) {
+    if (!element || !element[0]) return EliteBindContext::Ship;
+    if (std::strstr(element, "Humanoid") != nullptr) return EliteBindContext::OnFoot;
+    if (std::strstr(element, "Buggy") != nullptr) return EliteBindContext::Srv;
+    static const char* const kSrvExact[] = {
+        "ToggleDriveAssist", "SteeringAxis", "SteerLeftButton", "SteerRightButton",
+        "VerticalThrustersButton", "DriveSpeedAxis",
+        "IncreaseSpeedButtonMax", "DecreaseSpeedButtonMax",
+        "IncreaseSpeedButtonPartial", "DecreaseSpeedButtonPartial",
+        "RecallDismissShip",
+    };
+    for (const char* s : kSrvExact) {
+        if (std::strcmp(element, s) == 0) return EliteBindContext::Srv;
+    }
+    static const char* const kGeneralPrefixes[] = {
+        "UI_", "Cam", "VanityCamera", "FreeCam", "MoveFreeCam",
+        "PitchCamera", "YawCamera", "RollCamera", "FixCamera",
+        "FStop", "FocusDistance", "CommanderCreator_", "Store",
+        "Headlook", "HeadLook",
+    };
+    for (const char* p : kGeneralPrefixes) {
+        if (std::strncmp(element, p, std::strlen(p)) == 0) return EliteBindContext::General;
+    }
+    if (std::strstr(element, "FreeCam") != nullptr) return EliteBindContext::General;
+    static const char* const kGeneralExact[] = {
+        "UIFocus", "HMDReset", "Pause", "FriendsMenu", "MicrophoneMute",
+        "OpenCodexGoToDiscovery", "ShowPGScoreSummaryInput",
+        "CycleNextPanel", "CyclePreviousPanel", "CycleNextPage", "CyclePreviousPage",
+        "GalaxyMapHome", "PhotoCameraToggle", "ToggleVanityCamera",
+        "ToggleRotationLock", "QuitCamera", "ToggleAdvanceMode",
+        "TriggerColonisationModule", "PlaceSettlement", "RotateSettlementLeft",
+        "RotateSettlementRight", "ChangeConstructionOption", "ExitSettlementPlacementCamera",
+    };
+    for (const char* g : kGeneralExact) {
+        if (std::strcmp(element, g) == 0) return EliteBindContext::General;
+    }
+    return EliteBindContext::Ship;
+}
+
+// Collects every action element tag (<ActionName>, matching walkSlots and
+// parseElementIn's "<element>" presence test) present in one .binds file,
+// regardless of whether its slots are bound to a keyboard, gamepad, or {NoDevice}.
+void collectElementNamesIn(const std::string& text, std::unordered_set<std::string>* out) {
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t lt = text.find('<', pos);
+        if (lt == std::string::npos) break;
+        const size_t gt = text.find('>', lt);
+        if (gt == std::string::npos) break;
+        pos = gt + 1;
+        const char first = lt + 1 < text.size() ? text[lt + 1] : '\0';
+        if (first == '?' || first == '!' || first == '/') continue;
+        size_t nameEnd = lt + 1;
+        while (nameEnd < gt && text[nameEnd] != ' ' && text[nameEnd] != '\t' &&
+               text[nameEnd] != '\r' && text[nameEnd] != '\n' &&
+               text[nameEnd] != '/' && text[nameEnd] != '>') {
+            ++nameEnd;
+        }
+        const bool selfClosing = gt > lt && text[gt - 1] == '/';
+        const bool hasAttrs = nameEnd < gt && text[nameEnd] != '/' && text[nameEnd] != '>';
+        if (hasAttrs || selfClosing || nameEnd == lt + 1) continue;
+        const std::string name = text.substr(lt + 1, nameEnd - (lt + 1));
+        if (name == "Primary" || name == "Secondary" || name == "Modifier") continue;
+        out->insert(name);
+    }
+}
+
+struct AnsweringBindsFile {
+    std::wstring path;
+    char label[MAX_PATH];
+};
+
+void formatAnsweringFileLabel(const std::vector<AnsweringBindsFile>& files, char* out, size_t outLen) {
+    if (!out || !outLen || files.empty()) return;
+    if (files.size() == 1) {
+        snprintf(out, outLen, "%s", files[0].label);
+    } else {
+        snprintf(out, outLen, "%s (+%zu more)", files[0].label, files.size() - 1);
+    }
 }
 
 // Every slot in one file's text, with the element it belongs to. A small tag walker rather than a search per element: the
@@ -384,97 +602,52 @@ bool eliteBindsHmdResetIn(const char* text, size_t len, EliteResetBind* out) {
     return eliteBindsActionIn("HMDReset", text, len, out);
 }
 
-bool eliteBindsActionDir(const char* elementName, const wchar_t* dirC, EliteResetBind* out) {
+bool eliteBindsActionContextDir(const char* elementName, EliteBindContext ctx,
+                                const wchar_t* dirC, const wchar_t* gameDirC,
+                                EliteResetBind* out) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
     if (!dirC || !dirC[0]) return false;
     const std::wstring dir(dirC);
-    std::vector<Cand> cands;
-    if (!collectActiveBindsFiles(dir, &cands)) return false;
-    for (const Cand& c : cands) {
+    std::vector<ResolvedBindsFile> cands;
+    if (!collectContextBindsFiles(dir, gameDirC, ctx, &cands)) return false;
+    for (const ResolvedBindsFile& c : cands) {
         std::string text;
-        if (!readWholeFile(dir + L"\\" + c.name, &text)) continue;
+        if (!readWholeFile(c.path, &text)) continue;
         ++out->filesSeen;
         // The first file that CONTAINS the element answers alone (the camera lookup's rule).
         if (eliteBindsActionIn(elementName, text.data(), text.size(), out)) {
-            snprintf(out->file, sizeof(out->file), "%s", c.utf8);
+            snprintf(out->file, sizeof(out->file), "%s", c.label);
             return true;
         }
     }
     return false;
 }
 
+bool eliteBindsActionDir(const char* elementName, const wchar_t* dirC, EliteResetBind* out) {
+    return eliteBindsActionContextDir(elementName, EliteBindContext::General, dirC, nullptr, out);
+}
+
 bool eliteBindsHmdResetDir(const wchar_t* dirC, EliteResetBind* out) { return eliteBindsActionDir("HMDReset", dirC, out); }
 
 bool eliteBindsActionSrvDir(const char* elementName, const wchar_t* dirC, const wchar_t* gameDirC, EliteResetBind* out) {
-    if (!out) return false;
-    std::string presets;
-    std::wstring dir = dirC ? dirC : L"";
-    // Today's behaviour for the old one-line StartPreset.start, no file, or a short file.
-    if (dir.empty() || !readWholeFile(dir + L"\\StartPreset.4.start", &presets)) return eliteBindsActionDir(elementName, dirC, out);
-    std::vector<std::string> lines;   // one preset per bind context, blank lines kept so the index stays the context's: general, ship, SRV, on foot
-    {
-        size_t start = 0;
-        while (start <= presets.size()) {
-            size_t end = presets.find('\n', start);
-            if (end == std::string::npos) end = presets.size();
-            std::string l = presets.substr(start, end - start);
-            while (!l.empty() && (l.back() == '\r' || l.back() == ' ' || l.back() == '\t')) l.pop_back();
-            lines.push_back(l);
-            start = end + 1;
-        }
-    }
-    if (lines.size() < 4 || lines[2].empty()) return eliteBindsActionDir(elementName, dirC, out);
-    const std::string& preset = lines[2];
-    memset(out, 0, sizeof(*out));
-    // 1) Options\Bindings: the newest maintained file of that preset name, by the usual rule (the first file that contains the element answers).
-    std::vector<Cand> cands;
-    std::vector<std::string> names(1, preset);
-    if (collectBindsFilesFor(dir, names, &cands)) {
-        for (const Cand& c : cands) {
-            std::string text;
-            if (!readWholeFile(dir + L"\\" + c.name, &text)) continue;
-            ++out->filesSeen;
-            if (eliteBindsActionIn(elementName, text.data(), text.size(), out)) {
-                snprintf(out->file, sizeof(out->file), "%s", c.utf8);
-                return true;
-            }
-        }
-    }
-    // 2) the game directory's ControlSchemes\<preset>.binds: a stock preset (ConsoleX360 ...) is not copied to Options\Bindings until it is edited.
-    if (gameDirC && gameDirC[0] && preset.find_first_of("\\/:") == std::string::npos) {
-        wchar_t wname[MAX_PATH] = {};
-        MultiByteToWideChar(CP_UTF8, 0, preset.c_str(), -1, wname, MAX_PATH);
-        std::string text;
-        if (readWholeFile(std::wstring(gameDirC) + L"\\ControlSchemes\\" + wname + L".binds", &text)) {
-            ++out->filesSeen;
-            if (eliteBindsActionIn(elementName, text.data(), text.size(), out)) {
-                snprintf(out->file, sizeof(out->file), "ControlSchemes\\%s.binds", preset.c_str());
-                return true;
-            }
-        }
-    }
-    return false;
+    return eliteBindsActionContextDir(elementName, EliteBindContext::Srv, dirC, gameDirC, out);
+}
+
+bool eliteBindsActionContext(EliteBindContext ctx, const char* elementName, EliteResetBind* out) {
+    return eliteBindsActionContextDir(elementName, ctx, bindingsDir().c_str(), defaultGameDir().c_str(), out);
 }
 
 bool eliteBindsActionSrv(const char* elementName, EliteResetBind* out) {
-    wchar_t exe[MAX_PATH] = {};
-    std::wstring gameDir;
-    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);   // the game's exe: EDVR's d3d11.dll sits beside it
-    if (n > 0 && n < MAX_PATH) {
-        gameDir = exe;
-        const size_t slash = gameDir.find_last_of(L"\\/");
-        gameDir = slash == std::wstring::npos ? std::wstring() : gameDir.substr(0, slash);
-    }
-    return eliteBindsActionSrvDir(elementName, bindingsDir().c_str(), gameDir.c_str(), out);
+    return eliteBindsActionContext(EliteBindContext::Srv, elementName, out);
 }
 
 bool eliteBindsAction(const char* elementName, EliteResetBind* out) {
-    return eliteBindsActionDir(elementName, bindingsDir().c_str(), out);
+    return eliteBindsActionContext(EliteBindContext::General, elementName, out);
 }
 
 bool eliteBindsHmdReset(EliteResetBind* out) {
-    return eliteBindsHmdResetDir(bindingsDir().c_str(), out);
+    return eliteBindsActionContext(EliteBindContext::General, "HMDReset", out);
 }
 
 bool eliteBindsTranslateKey(const char* eliteKey, char* out, size_t outLen) {
@@ -707,22 +880,23 @@ bool parsePadIn(const std::string& text, const char* element, char* out,
     return false;
 }
 
-// The same file selection as eliteBindsLookupDir below (one walk,
-// collectActiveBindsFiles); the first file containing the element answers
+// The same file selection as eliteBindsLookupContextDir below (one walk,
+// collectContextBindsFiles); the first file containing the element answers
 // alone.
-bool eliteBindsLookupPadDir(const wchar_t* dirC, const char* element,
-                            char* out, size_t outLen) {
+bool eliteBindsLookupPadContextDir(const wchar_t* dirC, const wchar_t* gameDirC,
+                                   EliteBindContext ctx, const char* element,
+                                   char* out, size_t outLen) {
     if (!dirC || !dirC[0] || !element || !out || outLen == 0) return false;
     const std::wstring dir(dirC);
-    std::vector<Cand> cands;
-    if (!collectActiveBindsFiles(dir, &cands)) return false;
-    for (const Cand& c : cands) {
+    std::vector<ResolvedBindsFile> cands;
+    if (!collectContextBindsFiles(dir, gameDirC, ctx, &cands)) return false;
+    for (const ResolvedBindsFile& c : cands) {
         std::string text;
-        if (!readWholeFile(dir + L"\\" + c.name, &text)) continue;
+        if (!readWholeFile(c.path, &text)) continue;
         bool present = false;
         if (parsePadIn(text, element, out, outLen, &present)) {
             Log::get().note("bindings: %s gamepad slot read from %s: %s",
-                            element, c.utf8, out);
+                            element, c.label, out);
             return true;
         }
         if (present) return false;   // element answered: no pad slot
@@ -730,24 +904,38 @@ bool eliteBindsLookupPadDir(const wchar_t* dirC, const char* element,
     return false;
 }
 
-bool eliteBindsLookupPad(const char* element, char* out, size_t outLen) {
-    return eliteBindsLookupPadDir(bindingsDir().c_str(), element, out,
-                                  outLen);
+bool eliteBindsLookupPadDir(const wchar_t* dirC, const char* element,
+                            char* out, size_t outLen) {
+    return eliteBindsLookupPadContextDir(dirC, nullptr, EliteBindContext::Ship,
+                                         element, out, outLen);
 }
 
-bool eliteBindsLookupDir(const wchar_t* dirC, const char* element, char* out,
-                         size_t outLen, const char* fallbackElement) {
+bool eliteBindsLookupPadContext(EliteBindContext ctx, const char* element,
+                                char* out, size_t outLen) {
+    return eliteBindsLookupPadContextDir(bindingsDir().c_str(),
+                                         defaultGameDir().c_str(), ctx,
+                                         element, out, outLen);
+}
+
+bool eliteBindsLookupPad(const char* element, char* out, size_t outLen) {
+    return eliteBindsLookupPadContext(EliteBindContext::Ship, element, out,
+                                      outLen);
+}
+
+bool eliteBindsLookupContextDir(const wchar_t* dirC, const wchar_t* gameDirC,
+                                EliteBindContext ctx, const char* element,
+                                char* out, size_t outLen,
+                                const char* fallbackElement) {
     if (!dirC || !dirC[0] || !element || !out || outLen == 0) return false;
     const std::wstring dir(dirC);
 
-    // The active preset's files, newest first (the walk and its reasons
-    // are with collectActiveBindsFiles).
-    std::vector<Cand> cands;
-    if (!collectActiveBindsFiles(dir, &cands)) return false;
+    // This bind context's files, newest first in Options\Bindings, then stock ControlSchemes.
+    std::vector<ResolvedBindsFile> cands;
+    if (!collectContextBindsFiles(dir, gameDirC, ctx, &cands)) return false;
 
-    for (const Cand& c : cands) {
+    for (const ResolvedBindsFile& c : cands) {
         std::string text;
-        if (!readWholeFile(dir + L"\\" + c.name, &text)) continue;
+        if (!readWholeFile(c.path, &text)) continue;
         // The first file that CONTAINS the element answers ALONE -- falling
         // through to an older file would resurrect exactly the stale keys
         // recency exists to bury. The fallback element is consulted only
@@ -762,7 +950,7 @@ bool eliteBindsLookupDir(const wchar_t* dirC, const char* element, char* out,
             if (parseElementIn(text, wanted, out, outLen, &present, rawKb,
                                sizeof(rawKb))) {
                 Log::get().note("bindings: %s read from %s: %s", wanted,
-                                c.utf8, out);
+                                c.label, out);
                 return true;
             }
             if (present && rawKb[0] != '\0') {
@@ -772,14 +960,14 @@ bool eliteBindsLookupDir(const wchar_t* dirC, const char* element, char* out,
                     "cannot be watched. Please report this line; meanwhile "
                     "binding the action to an ordinary letter, F-key or arrow "
                     "in Elite will work.",
-                    wanted, c.utf8, rawKb);
+                    wanted, c.label, rawKb);
                 return false;
             }
             if (present) {
                 Log::get().note(
                     "bindings: %s in %s is not on a keyboard key, so there "
                     "is nothing for ED-UP to watch for it.",
-                    wanted, c.utf8);
+                    wanted, c.label);
                 return false;
             }
         }
@@ -787,23 +975,38 @@ bool eliteBindsLookupDir(const wchar_t* dirC, const char* element, char* out,
     return false;
 }
 
-bool eliteBindsLookup(const char* element, char* out, size_t outLen,
-                      const char* fallbackElement) {
-    return eliteBindsLookupDir(bindingsDir().c_str(), element, out, outLen,
-                               fallbackElement);
+bool eliteBindsLookupDir(const wchar_t* dirC, const char* element, char* out,
+                         size_t outLen, const char* fallbackElement) {
+    return eliteBindsLookupContextDir(dirC, nullptr, EliteBindContext::Ship,
+                                      element, out, outLen, fallbackElement);
 }
 
-bool eliteBindsLookupSlotsDir(const wchar_t* dirC, const char* element,
-                              unsigned flags, EliteKeySlots* out) {
+bool eliteBindsLookupContext(EliteBindContext ctx, const char* element,
+                             char* out, size_t outLen,
+                             const char* fallbackElement) {
+    return eliteBindsLookupContextDir(bindingsDir().c_str(),
+                                      defaultGameDir().c_str(), ctx, element,
+                                      out, outLen, fallbackElement);
+}
+
+bool eliteBindsLookup(const char* element, char* out, size_t outLen,
+                      const char* fallbackElement) {
+    return eliteBindsLookupContext(EliteBindContext::Ship, element, out,
+                                   outLen, fallbackElement);
+}
+
+bool eliteBindsLookupSlotsContextDir(const wchar_t* dirC, const wchar_t* gameDirC,
+                                     EliteBindContext ctx, const char* element,
+                                     unsigned flags, EliteKeySlots* out) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
     if (!dirC || !dirC[0] || !element) return false;
     const std::wstring dir(dirC);
-    std::vector<Cand> cands;
-    if (!collectActiveBindsFiles(dir, &cands)) return false;
-    for (const Cand& c : cands) {
+    std::vector<ResolvedBindsFile> cands;
+    if (!collectContextBindsFiles(dir, gameDirC, ctx, &cands)) return false;
+    for (const ResolvedBindsFile& c : cands) {
         std::string text;
-        if (!readWholeFile(dir + L"\\" + c.name, &text)) continue;
+        if (!readWholeFile(c.path, &text)) continue;
         ++out->filesSeen;
         // The first file that CONTAINS the element answers ALONE, whatever
         // its slots hold -- the camera lookup's rule, for the same reason:
@@ -811,55 +1014,185 @@ bool eliteBindsLookupSlotsDir(const wchar_t* dirC, const char* element,
         // recency exists to bury. No fallback element: MEASURED 2026-09-11,
         // none of the ten UI elements has a _Humanoid twin in Sean's file.
         if (parseElementSlotsIn(text, element, flags, out)) {
-            snprintf(out->file, sizeof(out->file), "%s", c.utf8);
+            snprintf(out->file, sizeof(out->file), "%s", c.label);
             return true;
         }
     }
     return false;
 }
 
+bool eliteBindsLookupSlotsDir(const wchar_t* dirC, const char* element,
+                              unsigned flags, EliteKeySlots* out) {
+    return eliteBindsLookupSlotsContextDir(dirC, nullptr, EliteBindContext::General,
+                                           element, flags, out);
+}
+
+bool eliteBindsLookupSlotsContext(EliteBindContext ctx, const char* element,
+                                  unsigned flags, EliteKeySlots* out) {
+    return eliteBindsLookupSlotsContextDir(bindingsDir().c_str(),
+                                           defaultGameDir().c_str(), ctx,
+                                           element, flags, out);
+}
+
 bool eliteBindsLookupSlots(const char* element, unsigned flags,
                            EliteKeySlots* out) {
-    return eliteBindsLookupSlotsDir(bindingsDir().c_str(), element, flags,
-                                    out);
+    return eliteBindsLookupSlotsContext(EliteBindContext::General, element,
+                                        flags, out);
+}
+
+namespace {
+
+// Walks each of Elite's four bind contexts through the same collectContextBindsFiles()
+// candidate order as direct action lookup, applying the identical per-action
+// "first file containing the element answers alone" rule (#182):
+// - If a newer file for a context omits an action, an older file or stock
+//   ControlSchemes preset can supply it (matching direct lookup).
+// - If a newer file defines the action (even as {NoDevice} or GamePad-only),
+//   older files cannot resurrect stale bindings for it.
+// - Scans each candidate up to at least 2048 entries before filtering and
+//   deduplicating into `out` so shadowed entries never truncate later unique binds.
+template <typename Entry, typename ScanFn, typename EqualFn>
+int collectUniqueUsesDirEx(const wchar_t* dirC, const wchar_t* gameDirC,
+                           Entry* out, int max, char* file, size_t fileLen,
+                           ScanFn&& scanIn, EqualFn&& equalEntry) {
+    if (file && fileLen) file[0] = '\0';
+    if (!dirC || !dirC[0] || !out || max <= 0) return -1;
+    const std::wstring dir(dirC);
+
+    struct CachedBindsFile {
+        std::wstring path;
+        std::string text;
+        std::unordered_set<std::string> elements;
+    };
+    std::vector<CachedBindsFile> cache;
+    auto loadCached = [&](const std::wstring& path) -> int {
+        for (size_t i = 0; i < cache.size(); ++i) {
+            if (_wcsicmp(cache[i].path.c_str(), path.c_str()) == 0) {
+                return static_cast<int>(i);
+            }
+        }
+        CachedBindsFile cf;
+        if (!readWholeFile(path, &cf.text)) return -1;
+        cf.path = path;
+        collectElementNamesIn(cf.text, &cf.elements);
+        cache.push_back(std::move(cf));
+        return static_cast<int>(cache.size() - 1);
+    };
+
+    std::vector<AnsweringBindsFile> answeringFiles;
+    auto noteAnswering = [&](const ResolvedBindsFile& cand) {
+        for (const AnsweringBindsFile& a : answeringFiles) {
+            if (_wcsicmp(a.path.c_str(), cand.path.c_str()) == 0) return;
+        }
+        AnsweringBindsFile a{};
+        a.path = cand.path;
+        snprintf(a.label, sizeof(a.label), "%s", cand.label);
+        answeringFiles.push_back(std::move(a));
+    };
+
+    bool anyReadable = false;
+    ResolvedBindsFile firstReadable{};
+    int total = 0;
+    const int scanCap = max > 2048 ? max : 2048;
+    std::vector<Entry> part(static_cast<size_t>(scanCap));
+    static constexpr EliteBindContext kContexts[4] = {
+        EliteBindContext::General,
+        EliteBindContext::Ship,
+        EliteBindContext::Srv,
+        EliteBindContext::OnFoot,
+    };
+    for (EliteBindContext ctx : kContexts) {
+        std::vector<ResolvedBindsFile> cands;
+        if (!collectContextBindsFiles(dir, gameDirC, ctx, &cands)) return -1;
+        std::unordered_set<std::string> seenElementsForCtx;
+        for (const ResolvedBindsFile& cand : cands) {
+            const int idx = loadCached(cand.path);
+            if (idx < 0) continue;
+            const CachedBindsFile& cf = cache[static_cast<size_t>(idx)];
+            if (!anyReadable) {
+                anyReadable = true;
+                firstReadable = cand;
+            }
+            bool contributed = false;
+            for (const std::string& el : cf.elements) {
+                if (eliteElementContext(el.c_str()) == ctx &&
+                    seenElementsForCtx.find(el) == seenElementsForCtx.end()) {
+                    contributed = true;
+                    break;
+                }
+            }
+            if (!contributed) continue;
+            noteAnswering(cand);
+            if (total < max) {
+                const int n = scanIn(cf.text, part.data(), scanCap);
+                for (int i = 0; i < n && total < max; ++i) {
+                    if (eliteElementContext(part[i].element) != ctx) continue;
+                    if (seenElementsForCtx.find(part[i].element) != seenElementsForCtx.end()) continue;
+                    bool dup = false;
+                    for (int j = 0; j < total; ++j) {
+                        if (equalEntry(out[j], part[i])) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) out[total++] = part[i];
+                }
+            }
+            for (const std::string& el : cf.elements) {
+                if (eliteElementContext(el.c_str()) == ctx) {
+                    seenElementsForCtx.insert(el);
+                }
+            }
+        }
+    }
+    if (!anyReadable) return -1;
+    if (answeringFiles.empty()) noteAnswering(firstReadable);
+    formatAnsweringFileLabel(answeringFiles, file, fileLen);
+    return total;
+}
+
+}  // namespace
+
+int eliteBindsKeyboardUsesDirEx(const wchar_t* dirC, const wchar_t* gameDirC,
+                                EliteKeyboardUse* out, int max, char* file, size_t fileLen) {
+    return collectUniqueUsesDirEx(
+        dirC, gameDirC, out, max, file, fileLen,
+        [](const std::string& text, EliteKeyboardUse* buf, int cap) {
+            return scanKeyboardUsesIn(text, buf, cap);
+        },
+        [](const EliteKeyboardUse& a, const EliteKeyboardUse& b) {
+            return std::strcmp(a.element, b.element) == 0 &&
+                   std::strcmp(a.binding, b.binding) == 0;
+        });
 }
 
 int eliteBindsKeyboardUsesDir(const wchar_t* dirC, EliteKeyboardUse* out, int max, char* file, size_t fileLen) {
-    if (file && fileLen) file[0] = '\0';
-    if (!dirC || !dirC[0] || !out || max <= 0) return -1;
-    const std::wstring dir(dirC);
-    std::vector<Cand> cands;
-    if (!collectActiveBindsFiles(dir, &cands)) return -1;
-    for (const Cand& c : cands) {
-        std::string text;
-        if (!readWholeFile(dir + L"\\" + c.name, &text)) continue;
-        if (file && fileLen) snprintf(file, fileLen, "%s", c.utf8);
-        return scanKeyboardUsesIn(text, out, max);
-    }
-    return -1;
+    return eliteBindsKeyboardUsesDirEx(dirC, nullptr, out, max, file, fileLen);
 }
 
 int eliteBindsKeyboardUses(EliteKeyboardUse* out, int max, char* file, size_t fileLen) {
-    return eliteBindsKeyboardUsesDir(bindingsDir().c_str(), out, max, file, fileLen);
+    return eliteBindsKeyboardUsesDirEx(bindingsDir().c_str(), defaultGameDir().c_str(), out, max, file, fileLen);
+}
+
+int eliteBindsAllUsesDirEx(const wchar_t* dirC, const wchar_t* gameDirC,
+                           EliteBindUse* out, int max, char* file, size_t fileLen) {
+    return collectUniqueUsesDirEx(
+        dirC, gameDirC, out, max, file, fileLen,
+        [](const std::string& text, EliteBindUse* buf, int cap) {
+            return scanAllUsesIn(text, buf, cap);
+        },
+        [](const EliteBindUse& a, const EliteBindUse& b) {
+            return std::strcmp(a.element, b.element) == 0 &&
+                   hotkeyBindingsEqual(a.binding, b.binding);
+        });
 }
 
 int eliteBindsAllUsesDir(const wchar_t* dirC, EliteBindUse* out, int max, char* file, size_t fileLen) {
-    if (file && fileLen) file[0] = '\0';
-    if (!dirC || !dirC[0] || !out || max <= 0) return -1;
-    const std::wstring dir(dirC);
-    std::vector<Cand> cands;
-    if (!collectActiveBindsFiles(dir, &cands)) return -1;
-    for (const Cand& c : cands) {
-        std::string text;
-        if (!readWholeFile(dir + L"\\" + c.name, &text)) continue;
-        if (file && fileLen) snprintf(file, fileLen, "%s", c.utf8);
-        return scanAllUsesIn(text, out, max);
-    }
-    return -1;
+    return eliteBindsAllUsesDirEx(dirC, nullptr, out, max, file, fileLen);
 }
 
 int eliteBindsAllUses(EliteBindUse* out, int max, char* file, size_t fileLen) {
-    return eliteBindsAllUsesDir(bindingsDir().c_str(), out, max, file, fileLen);
+    return eliteBindsAllUsesDirEx(bindingsDir().c_str(), defaultGameDir().c_str(), out, max, file, fileLen);
 }
 
 unsigned long long eliteBindsFingerprintDir(const wchar_t* dir) {
