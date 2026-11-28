@@ -1131,10 +1131,13 @@ void launcherBegin() {
     // work inside a Proton prefix. --direct-dry-run stays, as the way to find out.
     env.directLaunchOffered = !runningUnderWine();
     env.startNewLauncher = [](const std::wstring& exe) {
-        // Under Wine there is no restart: the session then shows "The launcher was updated. Close this window and
-        // start ED-UP again", as it does when a restart fails. A process the launcher starts may be ended with
-        // Steam's runtime container when the first one exits (unverified).
-        if (runningUnderWine()) return false;
+        if (runningUnderWine()) {
+            // The installed Linux wrapper relaunches after this Wine/Proton
+            // process exits. A portable copy can be reopened by the player.
+            wchar_t installed[2]{};
+            return GetEnvironmentVariableW(L"EDUP_LINUX_INSTALLED_LAUNCHER", installed, 2) == 1
+                && installed[0] == L'1';
+        }
         releaseInstanceMutex();  // the replacement waits for it, but not forever
         const bool started = startLauncherProcess(exe, restartArguments(true));
         if (!started) takeInstanceMutex(0);

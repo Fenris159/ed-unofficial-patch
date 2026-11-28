@@ -96,6 +96,10 @@ the full build receipt, launcher, native DLLs, the release ZIPs, and
 Flatpak bundle from that validated launcher at the same package version.
 It uploads them with `SHA256SUMS-linux` as
 `edvr-linux-installers-<run-id>-<run-attempt>`.
+Both installers start a writable launcher copy under
+`${XDG_DATA_HOME:-$HOME/.local/share}/ed-up-launcher/`, keyed by the bundled
+launcher hash. The launcher's signed updater replaces that copy, and the
+Linux wrapper starts the replacement after the Wine or Proton process exits.
 Build logs, phase timings, and failed flat pixel fixtures are
 uploaded separately even when a gate fails. The workflow does not create a
 GitHub release or use signing secrets.

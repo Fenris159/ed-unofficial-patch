@@ -8,6 +8,8 @@ Download `ed-up-launcher-linux-<version>.deb` for Debian or Ubuntu, or `ed-up-la
 
 Open the download with your software center and install it once. Then open **ED-UP Launcher** from your app menu. The menu entry uses the ED-UP icon and launches without a terminal. The Flatpak has permission to start the launcher on the host so it can use the existing game prefix and OpenXR runtime.
 
+Use the launcher's **Download & update** button when a signed release is available. If it includes a newer launcher, ED-UP updates your user copy and reopens automatically. If the patch also needs updating, ED-UP asks before changing the game files. This works with both the Debian package and the Flatpak bundle.
+
 ## Steam
 
 This section is for a Steam copy. That includes Flatpak Steam, when Steam's files are available to your user, and the Steam Deck. An Epic copy is [further down](#epic-on-linux).

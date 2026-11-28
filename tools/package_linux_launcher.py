@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from textwrap import dedent
 
 sys.dont_write_bytecode = True  # --dry-run must leave a clean checkout untouched.
 from gen_installer_rc import launcher_icon_png  # noqa: E402
@@ -144,25 +145,9 @@ def self_test():
             assert icon.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
             assert (stage / APP_DIR / LAUNCHER_ASSET).read_bytes() == b"MZ preview fixture"
             assert (stage / APP_DIR / INSTALLER).is_file()
-        # Exercise the installed launcher with a fake Windows launch boundary.
-        library = root / "native" / APP_DIR
-        (library / LAUNCHER_LINUX_WRAPPER).write_text(
-            "import sys\nfrom pathlib import Path\n"
-            "assert sys.argv[1] == '--desktop'\n"
-            "if '--dry-run' in sys.argv:\n"
-            "    assert '--launcher-exe' not in sys.argv\n"
-            "else:\n"
-            "    exe = Path(sys.argv[sys.argv.index('--launcher-exe') + 1])\n"
-            "    assert exe.read_bytes() == b'MZ preview fixture'\n"
-            "    assert exe != Path(__file__).with_name('ed-up-launcher.exe')\n"
-            "    assert sys.argv[-2:] == ['--', '--probe-openxr']\n", encoding="utf-8")
-        cache = root / "cache with spaces"
-        env = dict(os.environ, XDG_CACHE_HOME=str(cache))
-        launch = [sys.executable, str(library / INSTALLER)]
-        subprocess.run(launch + ["--dry-run"], env=env, check=True)
-        assert not cache.exists()
-        subprocess.run(launch + ["--", "--probe-openxr"], env=env, check=True)
-        assert list((cache / "ed-up-launcher").iterdir()) == []
+        if sys.platform == "linux":
+            for package in ("native", "flatpak"):
+                installed_update_self_test(root / package / APP_DIR, root / f"{package} data")
         if shutil.which("dpkg-deb"):
             output = root / "installers"
             command = ["0.23.0-rc1", "--launcher-exe", str(exe), "--output", str(output), "--format", "deb"]
@@ -175,6 +160,51 @@ def self_test():
             subprocess.run(["dpkg", "--compare-versions", version, "lt", "0.23.0"], check=True)
     print("package_linux_launcher: self-test passed")
     return 0
+
+
+def installed_update_self_test(library, data):
+    # Stand in for Proton and the updater's successful swap. The Windows
+    # launcher rig exercises downloading and verifying the signed release.
+    (library / LAUNCHER_LINUX_WRAPPER).write_text(dedent("""\
+        import os
+        import sys
+        from pathlib import Path
+
+        assert sys.argv[1:3] == ['--desktop', '--managed-launcher']
+        if '--dry-run' in sys.argv:
+            assert '--launcher-exe' not in sys.argv
+            sys.exit(0)
+        exe = Path(sys.argv[sys.argv.index('--launcher-exe') + 1])
+        assert exe != Path(__file__).with_name('ed-up-launcher.exe')
+        assert '--channel' in sys.argv and sys.argv[sys.argv.index('--channel') + 1] == 'rc'
+        backup = exe.with_name(exe.name + '.old')
+        started = exe.read_bytes().decode('ascii')
+        if '--updated' in sys.argv:
+            backup.unlink()
+            print('resumed', started)
+        else:
+            print('started', started)
+            replacement = os.environ.get('EDUP_TEST_LAUNCHER_UPDATE')
+            if replacement:
+                exe.replace(backup)
+                exe.write_bytes(replacement.encode('ascii'))
+            sys.exit(int(os.environ.get('EDUP_TEST_LAUNCHER_EXIT', '0')))
+        """), encoding="utf-8")
+    env = dict(os.environ, XDG_DATA_HOME=str(data), EDUP_TEST_LAUNCHER_UPDATE="", EDUP_TEST_LAUNCHER_EXIT="0")
+    launch = [sys.executable, str(library / INSTALLER)]
+    subprocess.run(launch + ["--dry-run"], env=env, check=True)
+    assert not data.exists()
+    launch += ["--", "--channel", "rc"]
+    updated = subprocess.check_output(launch, env=dict(env, EDUP_TEST_LAUNCHER_UPDATE="MZ v2"), text=True)
+    assert updated.splitlines() == ["started MZ preview fixture", "resumed MZ v2"]
+    reopened = subprocess.check_output(launch, env=env, text=True)
+    assert reopened.splitlines() == ["started MZ v2"]
+    stopped = subprocess.run(launch, env=dict(env, EDUP_TEST_LAUNCHER_UPDATE="MZ v3", EDUP_TEST_LAUNCHER_EXIT="37"),
+                             capture_output=True, text=True)
+    assert stopped.returncode == 37 and stopped.stdout.splitlines() == ["started MZ v2"]
+    recovered = subprocess.check_output(launch, env=env, text=True)
+    assert recovered.splitlines() == ["resumed MZ v3"]
+    assert (library / LAUNCHER_ASSET).read_bytes() == b"MZ preview fixture"
 
 
 def main(argv=None):

@@ -1474,6 +1474,16 @@ void testUpdater() {
         equal.launcherVersion = "0.4.0";
         Updater upEqual(http, equal);
         check(upEqual.check().launcherNeedsUpdate, "an equal version with a different digest is a launcher update");
+
+        check(adopt(&upSame, upSame.check(), &err), "the release payload is already cached: " + err);
+        UpdaterSettings olderCopy = same;
+        olderCopy.launcherSha256 = std::string(64, '1');
+        Updater upOlderCopy(http, olderCopy);
+        const UpdateCheck launcherOnly = upOlderCopy.check();
+        check(launcherOnly.outcome == UpdateOutcome::Available && launcherOnly.launcherNeedsUpdate,
+              "an older launcher is offered its replacement when the signed release is already cached");
+        check(upSame.check().outcome == UpdateOutcome::UpToDate,
+              "the matching launcher and cached payload are up to date");
     }
     // Commit needs the files; retention keeps three; offline load works; the payload follows.
     {

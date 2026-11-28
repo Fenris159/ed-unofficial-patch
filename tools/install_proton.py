@@ -16,11 +16,13 @@ APP_ID = "359320"
 PRODUCT = "Products/elite-dangerous-odyssey-64"
 MAX_VDF = 4 * 1024 * 1024
 OPENXR_IMPORT_ENV = "PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES"
+INSTALLED_LAUNCHER_ENV = "EDUP_LINUX_INSTALLED_LAUNCHER"
 
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--desktop", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--managed-launcher", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--launcher", action="store_true",
                    help="accepted and ignored: this wrapper only runs the launcher. ed-up-launcher.sh passes it. "
                         "Arguments after a literal -- go to the launcher, for either store")
@@ -778,6 +780,9 @@ def build_epic_plan(args, launcher, forwarded, home, env_in):
             del env[key]
     env["WINEPREFIX"] = str(prefix)
     env["STEAM_COMPAT_INSTALL_PATH"] = str(install_root)
+    env.pop(INSTALLED_LAUNCHER_ENV, None)
+    if args.managed_launcher:
+        env[INSTALLED_LAUNCHER_ENV] = "1"
     runtime = None
     if kind == "wine":
         env.pop("PROTONPATH", None)
@@ -811,7 +816,8 @@ def build_epic_plan(args, launcher, forwarded, home, env_in):
         flatpak = shutil.which("flatpak", path=env_in.get("PATH"))
         if not flatpak:
             raise ValueError("Flatpak executable missing; install the recorded manager or pass a host runner override")
-        permissions = {launcher.resolve(), install_root.resolve(), configured.expanduser().resolve()}
+        permissions = {launcher.parent if args.managed_launcher else launcher, install_root.resolve(),
+                       configured.expanduser().resolve()}
         if kind == "umu":
             permissions.add(Path(env["HOST_XDG_DATA_HOME"]) / "umu")
         for candidate in (runner, Path(recorded_env.get("PROTONPATH", "/app")), runtime):
@@ -821,7 +827,8 @@ def build_epic_plan(args, launcher, forwarded, home, env_in):
             "--filesystem=" + str(path) for path in sorted(permissions, key=str)
         ] + ["--unset-env=" + key for key in sorted(env_in.keys() - env.keys())
         ] + ["--env=%s=%s" % (key, env[key]) for key in sorted(env)
-             if key in recorded_env or key in sandbox_env or key.startswith(("WINE", "PROTON", "UMU_", "STEAM_COMPAT_")) or key in ("GAMEID", "STORE")
+             if key in recorded_env or key in sandbox_env or key.startswith(("WINE", "PROTON", "UMU_", "STEAM_COMPAT_"))
+             or key in ("GAMEID", "STORE", INSTALLED_LAUNCHER_ENV)
         ] + [flatpak_id] + command[1:]
         env = dict(env_in)
     return command, env, (game, compatdata or prefix, runner, runtime)
@@ -898,6 +905,9 @@ def build_plan(args, *, script=Path(__file__), home=Path.home(), environ=None):
                STEAM_COMPAT_CLIENT_INSTALL_PATH=str(steam_root), STEAM_COMPAT_DATA_PATH=str(compatdata),
                STEAM_COMPAT_INSTALL_PATH=str(install_root),
                STEAM_COMPAT_LIBRARY_PATHS=":".join(str(lib / "steamapps") for lib in libraries(steam_root)))
+    env.pop(INSTALLED_LAUNCHER_ENV, None)
+    if args.managed_launcher:
+        env[INSTALLED_LAUNCHER_ENV] = "1"
     if runtime:
         # The launcher runs outside Steam's game launch options. Import the host runtime
         # into its own Pressure Vessel container so the OpenXR probe can reach it.
@@ -915,7 +925,8 @@ def build_plan(args, *, script=Path(__file__), home=Path.home(), environ=None):
             raise ValueError("Flatpak executable missing; install the selected Steam Flatpak")
         user_installation, _ = flatpak_installations(home, env_in)
         selector = "--user" if installation == user_installation else "--system"
-        permissions = {launcher.resolve(), steam_root, compatdata, *libraries(steam_root)}
+        permissions = {launcher.parent if args.managed_launcher else launcher, steam_root, compatdata,
+                       *libraries(steam_root)}
         if not inside(sandbox_proton, Path("/app")) and not inside(sandbox_proton, Path("/usr")):
             permissions.add(sandbox_proton.parent)
         env.update(sandbox_env)
@@ -924,7 +935,7 @@ def build_plan(args, *, script=Path(__file__), home=Path.home(), environ=None):
             "--filesystem=" + str(path) for path in sorted(permissions, key=str)
         ] + ["--unset-env=" + key for key in sorted(env_in.keys() - env.keys())
         ] + ["--env=%s=%s" % (key, env[key]) for key in sorted(env)
-             if key in sandbox_env or key in ("SteamAppId", "SteamGameId", OPENXR_IMPORT_ENV)
+             if key in sandbox_env or key in ("SteamAppId", "SteamGameId", OPENXR_IMPORT_ENV, INSTALLED_LAUNCHER_ENV)
              or key.startswith("STEAM_COMPAT_")
         ] + [flatpak_id] + command[1:]
         env = dict(env_in)
@@ -979,7 +990,8 @@ def run(args, *, script=Path(__file__), home=Path.home(), environ=None,
         display_env = {} if command[1:2] == ["run"] else env
         for key in ("SteamAppId", "SteamGameId", "STEAM_COMPAT_APP_ID",
                     "STEAM_COMPAT_CLIENT_INSTALL_PATH", "STEAM_COMPAT_DATA_PATH",
-                    "STEAM_COMPAT_INSTALL_PATH", "STEAM_COMPAT_LIBRARY_PATHS", OPENXR_IMPORT_ENV):
+                    "STEAM_COMPAT_INSTALL_PATH", "STEAM_COMPAT_LIBRARY_PATHS", OPENXR_IMPORT_ENV,
+                    INSTALLED_LAUNCHER_ENV):
             if key in display_env:
                 print("  %s=%s" % (key, shlex.quote(display_env[key])))
         for key in ("WINEPREFIX", "PROTONPATH", "PROTON_VERB", "UMU_RUNTIME_UPDATE"):
@@ -1490,6 +1502,10 @@ def epic_self_test():
         assert "--env=WINEPREFIX=" + str(prefix) in command
         assert "--filesystem=" + str(exe) in command and "--filesystem=" + str(install) in command
         assert "secret-not-for-output" not in shlex.join(command)
+        installed, _, _ = build_plan(parse("--store", "epic", "--managed-launcher"),
+                                     script=script, home=home, environ=env)
+        assert "--filesystem=" + str(exe.parent) in installed and "--filesystem=" + str(exe) not in installed
+        assert "--env=EDUP_LINUX_INSTALLED_LAUNCHER=1" in installed
         deployed_wine.unlink()
         refuses(("--store", "epic"), "installed Flatpak")
 
@@ -2216,6 +2232,10 @@ def steam_context_self_test(only=None):
                         assert "--unset-env=SteamAppId" not in command
                         assert "must-not-print-unset-value" not in output
                         assert "--env=PATH=/app/bin:/usr/bin" in command
+                    installed, _, _ = plan("--managed-launcher")
+                    assert "--filesystem=" + str(script.parent) in installed
+                    assert "--filesystem=" + str(script.parent / "ed-up-launcher.exe") not in installed
+                    assert "--env=EDUP_LINUX_INSTALLED_LAUNCHER=1" in installed
                     if case in ("flatpak-usr", "flatpak-parent-usr", "flatpak-parent-app"):
                         (runner_files / "toolmanifest.vdf").write_text('\"manifest\" { \"version\" \"2\" }', encoding="utf-8")
                         direct = ("/app/share/steam/compatibilitytools.d/Proton-GE/proton" if case == "flatpak-parent-app"
